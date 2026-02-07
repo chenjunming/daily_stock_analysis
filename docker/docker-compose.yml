@@ -7,8 +7,6 @@
 #   WebUI模式: docker-compose -f ./docker/docker-compose.yml up -d webui
 #   同时启动: docker-compose -f ./docker/docker-compose.yml up -d analyzer webui
 
-version: '3.8'
-
 x-common: &common
   build:
     context: ..
