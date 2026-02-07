@@ -724,481 +724,6 @@ class NotificationService:
             rows.append(("预期差", self._short_text(result.market_sentiment, 220)))
 
         return rows
-
-    @staticmethod
-    def _to_float(value: Any) -> Optional[float]:
-        """尽量将输入值转换为浮点数（兼容“39.01元”）。"""
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        text = str(value).strip()
-        if not text:
-            return None
-        m = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
-        if not m:
-            return None
-        try:
-            return float(m.group(0))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _fmt_number(value: Any, digits: int = 2, default: str = "暂缺公开口径") -> str:
-        num = NotificationService._to_float(value)
-        if num is None:
-            text = str(value or "").strip()
-            return text if text else default
-        return f"{num:.{digits}f}"
-
-    def _fmt_pct_value(self, value: Any, default: str = "暂缺公开口径") -> str:
-        num = self._to_float(value)
-        if num is None:
-            text = str(value or "").strip()
-            if not text:
-                return default
-            return text if text.endswith("%") else text
-        return f"{num:.2f}%"
-
-    def _fmt_currency_value(self, value: Any, default: str = "暂缺公开口径") -> str:
-        num = self._to_float(value)
-        if num is None:
-            text = str(value or "").strip()
-            return text if text else default
-        return f"{num:.2f}元"
-
-    def _fmt_market_cap(self, value: Any, default: str = "暂缺公开口径") -> str:
-        raw_text = str(value or "").strip()
-        if raw_text and any(u in raw_text for u in ("万亿元", "万亿", "亿元", "亿", "万元", "万")):
-            return raw_text
-        num = self._to_float(value)
-        if num is None:
-            return raw_text if raw_text else default
-        # 默认按元口径转换为亿元；若本身已是较小值，则直接展示
-        if abs(num) >= 1e8:
-            return f"{num / 1e8:.2f}亿元"
-        if abs(num) >= 1e4:
-            return f"{num / 1e4:.2f}万元"
-        return f"{num:.2f}"
-
-    @staticmethod
-    def _first_non_empty(*values: Any) -> Any:
-        for v in values:
-            if v is None:
-                continue
-            text = str(v).strip()
-            if text:
-                return v
-        return None
-
-    @staticmethod
-    def _extract_market_cap_from_text(text: str) -> Optional[str]:
-        """
-        从文本中提取“市值xx万亿/xx亿元”等表达并原样标准化返回。
-        """
-        if not text:
-            return None
-        normalized = str(text).replace(",", "")
-        patterns = [
-            r"市值\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)\s*(万亿|万亿元|亿|亿元|万元|万)",
-            r"\bmv\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*(万亿|万亿元|亿|亿元|万元|万)",
-        ]
-        for p in patterns:
-            m = re.search(p, normalized, flags=re.IGNORECASE)
-            if not m:
-                continue
-            num = m.group(1)
-            unit = m.group(2)
-            if unit in {"万亿", "万亿元"}:
-                return f"{num}万亿元"
-            if unit in {"亿", "亿元"}:
-                return f"{num}亿元"
-            if unit in {"万元", "万"}:
-                return f"{num}万元"
-        return None
-
-    @staticmethod
-    def _extract_ratio_from_text(text: str, key: str) -> Optional[str]:
-        """
-        从文本中提取 PE/PB 比率（例如 PE 22.5、PB=2.9倍）。
-        """
-        if not text:
-            return None
-        normalized = str(text).replace(",", "")
-        pattern = rf"\b{key}\s*(?:[-_ ]?TTM)?\s*[:=：]?\s*([0-9]+(?:\.[0-9]+)?)"
-        m = re.search(pattern, normalized, flags=re.IGNORECASE)
-        if not m:
-            return None
-        return m.group(1)
-
-    def _extract_template_blocks(self, dashboard: Dict[str, Any]) -> Dict[str, Any]:
-        blocks = self._as_dict((dashboard or {}).get("template_blocks", {}))
-        normalized = {
-            "position_snapshot": self._as_dict(blocks.get("position_snapshot", {})),
-            "fundamental_snapshot": self._as_dict(blocks.get("fundamental_snapshot", {})),
-            "institutional_view": self._as_dict(blocks.get("institutional_view", {})),
-            "technical_levels": self._as_dict(blocks.get("technical_levels", {})),
-            "operation_playbook": self._as_dict(blocks.get("operation_playbook", {})),
-        }
-        for k in ("growth_drivers", "month_scenarios", "risk_items"):
-            raw = blocks.get(k, [])
-            if isinstance(raw, list):
-                normalized[k] = raw
-            elif isinstance(raw, str) and raw.strip():
-                normalized[k] = [raw.strip()]
-            else:
-                normalized[k] = []
-        return normalized
-
-    @staticmethod
-    def _split_to_items(value: Any, max_items: int = 5) -> List[str]:
-        if isinstance(value, list):
-            out = [str(x).strip() for x in value if str(x or "").strip()]
-            return out[:max_items]
-        if isinstance(value, str):
-            text = value.replace("\r", "\n").strip()
-            if not text:
-                return []
-            parts = re.split(r"[;\n。；]+", text)
-            out = [p.strip(" -•\t") for p in parts if p.strip(" -•\t")]
-            return out[:max_items]
-        return []
-
-    @staticmethod
-    def _calc_default_prob(score: int) -> tuple:
-        if score >= 70:
-            return (45, 40, 15)
-        if score >= 55:
-            return (30, 50, 20)
-        if score >= 40:
-            return (20, 55, 25)
-        return (10, 40, 50)
-
-    def _derive_month_scenarios(
-        self,
-        dashboard: Dict[str, Any],
-        template_blocks: Dict[str, Any]
-    ) -> List[Dict[str, str]]:
-        raw = template_blocks.get("month_scenarios", [])
-        scenarios: List[Dict[str, str]] = []
-        if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, dict):
-                    scenarios.append({
-                        "name": str(item.get("name") or item.get("scenario") or "").strip(),
-                        "probability": str(item.get("probability") or "").strip(),
-                        "price_range": str(item.get("price_range") or "").strip(),
-                        "trigger": str(item.get("trigger") or item.get("condition") or "").strip(),
-                    })
-        scenarios = [x for x in scenarios if x.get("name")]
-        return scenarios[:3]
-
-    def generate_template_stock_section(self, result: AnalysisResult) -> List[str]:
-        """
-        生成模板化单股章节（用于单股推送和详细报告复用）。
-        """
-        dashboard = self._as_dict(getattr(result, "dashboard", None))
-        template_blocks = self._extract_template_blocks(dashboard)
-        data_persp = self._as_dict(dashboard.get("data_perspective", {}))
-        trend_data = self._as_dict(data_persp.get("trend_status", {}))
-        price_data = self._as_dict(data_persp.get("price_position", {}))
-        vol_data = self._as_dict(data_persp.get("volume_analysis", {}))
-        intel = self._as_dict(dashboard.get("intelligence", {}))
-        battle = self._as_dict(dashboard.get("battle_plan", {}))
-        strategy = self._as_dict(dashboard.get("strategy_execution", {}))
-        final_gate = self._as_dict(strategy.get("final_gate", {}))
-        execution = self._as_dict(strategy.get("execution_plan", {}))
-        core = self._as_dict(dashboard.get("core_conclusion", {}))
-        signal_text, signal_emoji, _ = self._get_signal_level(result)
-        stock_name = result.name if result.name and not result.name.startswith("股票") else f"股票{result.code}"
-
-        position_snapshot = template_blocks.get("position_snapshot", {})
-        user_holding = getattr(result, "user_holding", None) or {}
-        intel_text_pack = " ".join([
-            str(self._as_dict(intel.get("valuation_snapshot", {})).get("valuation_conclusion", "") or ""),
-            str(result.fundamental_analysis or ""),
-            str(result.analysis_summary or ""),
-            str(result.news_summary or ""),
-        ]).strip()
-        current_price = (
-            position_snapshot.get("latest_price")
-            or position_snapshot.get("current_price")
-            or user_holding.get("current_price")
-            or price_data.get("current_price")
-        )
-        avg_cost = position_snapshot.get("avg_cost") or position_snapshot.get("cost") or user_holding.get("avg_cost")
-        pnl_pct = position_snapshot.get("pnl_pct") or user_holding.get("pnl_pct")
-        cp_num = self._to_float(current_price)
-        cost_num = self._to_float(avg_cost)
-        if pnl_pct is None and cp_num is not None and cost_num not in (None, 0):
-            pnl_pct = (cp_num - cost_num) / cost_num * 100.0
-        market_cap = self._first_non_empty(
-            position_snapshot.get("market_cap"),
-            self._as_dict(dashboard.get("data_perspective", {})).get("market_cap"),
-            price_data.get("market_cap"),
-            self._extract_market_cap_from_text(intel_text_pack),
-        )
-        pe_ttm = self._first_non_empty(
-            position_snapshot.get("pe_ttm"),
-            position_snapshot.get("pe_ratio"),
-            self._extract_ratio_from_text(intel_text_pack, "pe"),
-        )
-        pb = self._first_non_empty(
-            position_snapshot.get("pb"),
-            position_snapshot.get("pb_ratio"),
-            self._extract_ratio_from_text(intel_text_pack, "pb"),
-        )
-        turnover = position_snapshot.get("turnover_rate") or vol_data.get("turnover_rate")
-
-        lines: List[str] = [
-            f"## 📊 {stock_name}({result.code}) 走势分析报告",
-            "",
-            "### 持仓现状",
-            "",
-            "| 指标 | 数据 |",
-            "|---|---|",
-            f"| 您的成本 | {self._fmt_currency_value(avg_cost)} |",
-            f"| 最新价 | {self._fmt_currency_value(current_price)} |",
-            f"| 当前盈亏 | {self._fmt_pct_value(pnl_pct)} |",
-            f"| 市值 | {self._fmt_market_cap(market_cap)} |",
-            f"| PE-TTM | {self._fmt_number(pe_ttm, 2)} |",
-            f"| PB | {self._fmt_number(pb, 2)} |",
-            f"| 换手率 | {self._fmt_pct_value(turnover)} |",
-            "",
-        ]
-
-        if self._is_missing_text(market_cap) or self._is_missing_text(pe_ttm) or self._is_missing_text(pb):
-            lines.append("说明：部分估值字段暂缺公开口径，以下判断以趋势、量价和舆情信息为主。")
-            lines.append("")
-
-        # 基本面分析
-        fund = template_blocks.get("fundamental_snapshot", {})
-        fund_summary = (
-            fund.get("annual_summary")
-            or fund.get("phase_summary")
-            or result.fundamental_analysis
-            or result.analysis_summary
-            or "无法判断（数据不足）"
-        )
-        company_analysis = self._as_dict(intel.get("company_analysis", {}))
-        highlights = self._split_to_items(
-            fund.get("business_highlights") or fund.get("highlights") or result.company_highlights,
-            max_items=4
-        )
-        structure = self._split_to_items(fund.get("business_structure") or fund.get("segments"), max_items=4)
-        if not highlights:
-            highlights = self._split_to_items(
-                f"{company_analysis.get('growth_quality', '')};{result.news_summary or ''}",
-                max_items=4
-            )
-        if not structure:
-            structure = self._split_to_items(company_analysis.get("positioning", ""), max_items=4)
-        lines.extend([
-            "### 基本面分析",
-            "",
-            f"- 阶段结论：{self._short_text(fund_summary, 220) or '无法判断（数据不足）'}",
-        ])
-        if highlights:
-            lines.append("- 业务亮点：")
-            for item in highlights:
-                lines.append(f"  - {item}")
-        else:
-            lines.append("- 业务亮点：暂缺公开口径，关注后续财报和经营指引。")
-        if structure:
-            lines.append("- 业务结构：")
-            for item in structure:
-                lines.append(f"  - {item}")
-        else:
-            lines.append("- 业务结构：暂无可验证拆分，优先观察营收与利润增速。")
-        lines.append("")
-
-        # 机构观点与目标区间
-        inst = template_blocks.get("institutional_view", {})
-        ratings = inst.get("ratings")
-        lines.extend(["### 机构观点与目标区间", ""])
-        if isinstance(ratings, list) and ratings:
-            lines.extend([
-                "| 机构 | 评级 | 目标价 |",
-                "|---|---|---|",
-            ])
-            for r in ratings[:4]:
-                if not isinstance(r, dict):
-                    continue
-                lines.append(
-                    f"| {r.get('institution', '暂缺公开口径')} | "
-                    f"{r.get('rating', '暂缺公开口径')} | "
-                    f"{r.get('target_price', '暂缺公开口径')} |"
-                )
-            lines.append("")
-        else:
-            valuation = self._as_dict(intel.get("valuation_snapshot", {}))
-            trend_score = trend_data.get("trend_score", result.sentiment_score)
-            lines.extend([
-                f"- 暂无统一机构目标价；估值结论参考：{valuation.get('valuation_conclusion', '暂缺公开口径')}",
-                f"- 市场一致预期替代视角：趋势评分 {trend_score}/100，预期差判断 {self._as_dict(intel.get('expectation_gap', {})).get('gap_verdict', '暂缺公开口径')}",
-                "",
-            ])
-
-        # 技术面分析
-        tech = template_blocks.get("technical_levels", {})
-        strong_res = tech.get("strong_resistance") or tech.get("resistance_level") or price_data.get("resistance_level") or "暂缺公开口径"
-        short_res = tech.get("short_resistance") or tech.get("near_resistance") or price_data.get("resistance_level") or "暂缺公开口径"
-        strong_sup = tech.get("strong_support") or tech.get("support_level") or price_data.get("support_level") or "暂缺公开口径"
-        trend_judgement = (
-            tech.get("current_trend")
-            or
-            tech.get("judgement")
-            or result.trend_analysis
-            or ""
-        )
-        technical_conclusion = str(
-            tech.get("conclusion")
-            or ""
-        ).strip()
-        level_notes = self._as_dict(tech.get("notes", {}))
-        note_strong_res = str(level_notes.get("strong_resistance") or "需 AI 补全").strip()
-        note_short_res = str(level_notes.get("short_resistance") or "需 AI 补全").strip()
-        note_current = str(level_notes.get("current_position") or "需 AI 补全").strip()
-        note_strong_sup = str(level_notes.get("strong_support") or "需 AI 补全").strip()
-        lines.extend([
-            "### 技术面分析",
-            "",
-            f"- 当前走势：{self._short_text(trend_judgement, 220) if trend_judgement else '暂缺公开口径（需 AI 补全）'}",
-            "",
-            "| 类型 | 价位 | 说明 |",
-            "|---|---|---|",
-            f"| 强阻力 | {strong_res} | {note_strong_res} |",
-            f"| 短期阻力 | {short_res} | {note_short_res} |",
-            f"| 当前位置 | {self._fmt_currency_value(current_price)} | {note_current} |",
-            f"| 强支撑 | {strong_sup} | {note_strong_sup} |",
-            "",
-            f"- 技术结论：{technical_conclusion if technical_conclusion else '暂缺公开口径（需 AI 补全）'}",
-            "",
-        ])
-
-        # 未来增长驱动
-        raw_drivers = template_blocks.get("growth_drivers", [])
-        drivers: List[str] = []
-        if isinstance(raw_drivers, list):
-            for item in raw_drivers:
-                if isinstance(item, dict):
-                    d = str(item.get("driver") or item.get("title") or "").strip()
-                    s = str(item.get("signal") or item.get("watch_signal") or "").strip()
-                    if d:
-                        drivers.append(f"驱动点：{d}；观察信号：{s or '待AI补充'}")
-                elif isinstance(item, str) and item.strip():
-                    drivers.append(item.strip())
-        lines.extend(["### 未来增长驱动", ""])
-        if drivers:
-            for idx, item in enumerate(drivers[:4], start=1):
-                lines.append(f"{idx}. {item}")
-        else:
-            lines.append("1. 暂缺公开口径（需 AI 根据基础数据补全增长驱动与观察信号）")
-        lines.append("")
-
-        # 未来一个月情景预测
-        scenarios = self._derive_month_scenarios(dashboard, template_blocks)
-        lines.extend([
-            "### 未来一个月走势预测",
-            "",
-            "| 情景 | 概率 | 价格区间 | 触发条件 |",
-            "|---|---|---|---|",
-        ])
-        if scenarios:
-            for sc in scenarios[:3]:
-                lines.append(
-                    f"| {sc.get('name', '中性')} | {sc.get('probability', '暂缺公开口径')} | "
-                    f"{sc.get('price_range', '暂缺公开口径')} | {sc.get('trigger', '暂缺公开口径')} |"
-                )
-        else:
-            lines.append("| 暂缺 | 暂缺公开口径 | 暂缺公开口径 | 需 AI 基于现价、MA20、支撑阻力、量能与风险闸门补全 |")
-        lines.append("")
-
-        # 操作建议
-        sniper = self._as_dict(battle.get("sniper_points", {}))
-        operation = template_blocks.get("operation_playbook", {})
-        advice = self._get_effective_operation_advice(result) or result.operation_advice or "观望"
-        passive_plan = str(
-            operation.get("passive_hold")
-            or operation.get("plan_1")
-            or operation.get("hold_plan")
-            or ""
-        ).strip()
-        active_plan = str(
-            operation.get("active_adjust")
-            or operation.get("plan_2")
-            or operation.get("adjust_plan")
-            or ""
-        ).strip()
-        range_plan = str(
-            operation.get("range_strategy")
-            or operation.get("plan_3")
-            or ""
-        ).strip()
-        stop_loss = str(
-            operation.get("stop_loss")
-            or execution.get("invalidation")
-            or sniper.get("stop_loss")
-            or ""
-        ).strip()
-        invalidation = str(
-            operation.get("invalidation")
-            or execution.get("invalidation")
-            or final_gate.get("alternative_plan")
-            or ""
-        ).strip()
-        lines.extend([
-            "### 操作建议",
-            "",
-            "方案一：被动持有",
-            f"- 建议动作：{advice}",
-            f"- 执行细则：{passive_plan if passive_plan else '暂缺公开口径（需 AI 补全）'}",
-            "",
-            "方案二：主动调整仓位",
-            f"- 执行细则：{active_plan if active_plan else '暂缺公开口径（需 AI 补全）'}",
-            f"- 仓位动作：买入 {execution.get('buy_size_pct', '暂缺公开口径')} / 减仓 {execution.get('sell_size_pct', '暂缺公开口径')}",
-            "",
-            "方案三：区间策略",
-            f"- 执行细则：{range_plan if range_plan else '暂缺公开口径（需 AI 补全）'}",
-            f"- 止损条件：{stop_loss if stop_loss else '暂缺公开口径（需 AI 补全）'}",
-            f"- 失效条件：{invalidation if invalidation else '暂缺公开口径（需 AI 补全）'}",
-            "",
-        ])
-
-        # 风险提示
-        risk_items = template_blocks.get("risk_items", [])
-        risks: List[str] = []
-        for r in risk_items:
-            if isinstance(r, dict):
-                name = str(r.get("name") or r.get("risk") or "").strip()
-                detail = str(r.get("detail") or r.get("impact") or "").strip()
-                if name:
-                    risks.append(f"{name}：{detail or '需持续跟踪'}")
-            elif isinstance(r, str) and r.strip():
-                risks.append(r.strip())
-        if not risks:
-            risks.extend(self._split_to_items(intel.get("risk_alerts", []), max_items=5))
-        if not risks:
-            risks.extend(self._split_to_items(result.risk_warning, max_items=5))
-        if not risks:
-            risks = [
-                "政策风险：监管规则变化可能影响估值中枢。",
-                "竞争风险：同业竞争加剧可能压缩利润空间。",
-                "市场风险：指数波动可能放大个股回撤。",
-            ]
-        lines.extend(["### 风险提示", ""])
-        for item in risks[:5]:
-            lines.append(f"- {item}")
-        lines.append("")
-
-        lines.extend([
-            "### 结论摘要",
-            "",
-            f"- 信号结论：{signal_emoji} {signal_text} | 趋势 {result.trend_prediction} | 评分 {result.sentiment_score}",
-            f"- 一句话：{core.get('one_sentence', result.analysis_summary or '暂无摘要')}",
-            "",
-        ])
-        return lines
     
     def generate_dashboard_report(
         self,
@@ -1254,9 +779,222 @@ class NotificationService:
                 "",
             ])
 
-        # 逐个股票模板化章节（融合新模板与原详细报告外层）
+        # 逐个股票的决策仪表盘
         for result in sorted_results:
-            report_lines.extend(self.generate_template_stock_section(result))
+            signal_text, signal_emoji, signal_tag = self._get_signal_level(result)
+            dashboard = self._as_dict(getattr(result, "dashboard", None))
+            
+            # 股票名称（优先使用 dashboard 或 result 中的名称）
+            stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+            
+            report_lines.extend([
+                f"## {signal_emoji} {stock_name} ({result.code})",
+                "",
+            ])
+            
+            # ========== 舆情与基本面概览（放在最前面）==========
+            intel = self._as_dict(dashboard.get('intelligence', {}))
+            if intel:
+                intel_rows = self._build_intel_table_rows(intel, result)
+                if intel_rows:
+                    report_lines.extend([
+                        "### 📰 重要信息速览",
+                        "",
+                        "| 类别 | 内容 |",
+                        "|---|---|",
+                    ])
+                    for k, v in intel_rows:
+                        if self._is_missing_text(v):
+                            continue
+                        report_lines.append(f"| {k} | {v} |")
+                    report_lines.append("")
+            
+            # ========== 核心结论 ==========
+            core = self._as_dict(dashboard.get('core_conclusion', {}))
+            one_sentence = core.get('one_sentence', result.analysis_summary)
+            time_sense = core.get('time_sensitivity', '本周内')
+            pos_advice = self._as_dict(core.get('position_advice', {}))
+            strategy = self._as_dict(dashboard.get('strategy_execution', {}))
+            final_gate = strategy.get('final_gate', {}) if isinstance(strategy, dict) else {}
+            alt_plan_text = str(final_gate.get('alternative_plan', '') or '')
+            
+            report_lines.extend([
+                "### 📌 核心结论",
+                "",
+                f"**{signal_emoji} {signal_text}** | {result.trend_prediction}",
+                "",
+                f"> **一句话决策**: {one_sentence}",
+                "",
+                f"⏰ **时效性**: {time_sense}",
+                "",
+            ])
+            if "关键维度缺失" in alt_plan_text:
+                report_lines.extend([
+                    "⚠️ **可靠性提示**: 当前数据维度不完整，结论置信度已下调，建议以风控优先。",
+                    "",
+                ])
+
+            # AI理解层（软建议，不覆盖硬风控）
+            before_ai_lines = len(report_lines)
+            self._append_discretionary_section(report_lines, dashboard)
+            if len(report_lines) == before_ai_lines:
+                self._append_discretionary_fallback(report_lines, result, dashboard)
+            
+            # 持仓分类建议
+            if pos_advice:
+                report_lines.extend([
+                    "| 持仓情况 | 操作建议 |",
+                    "|---------|---------|",
+                    f"| 🆕 **空仓者** | {pos_advice.get('no_position', result.operation_advice)} |",
+                    f"| 💼 **持仓者** | {pos_advice.get('has_position', '继续持有')} |",
+                    "",
+                ])
+
+            # ========== 用户持仓视角 ==========
+            self._append_user_position_section(report_lines, result, dashboard)
+            
+            # ========== 数据透视 ==========
+            data_persp = self._as_dict(dashboard.get('data_perspective', {}))
+            if data_persp:
+                trend_data = self._as_dict(data_persp.get('trend_status', {}))
+                price_data = self._as_dict(data_persp.get('price_position', {}))
+                vol_data = self._as_dict(data_persp.get('volume_analysis', {}))
+                chip_data = self._as_dict(data_persp.get('chip_structure', {}))
+                
+                report_lines.extend([
+                    "### 📊 数据透视",
+                    "",
+                ])
+                
+                # 趋势状态
+                if trend_data:
+                    is_bullish = "✅ 是" if trend_data.get('is_bullish', False) else "❌ 否"
+                    report_lines.extend([
+                        f"**均线排列**: {trend_data.get('ma_alignment', 'N/A')} | 多头排列: {is_bullish} | 趋势强度: {trend_data.get('trend_score', 'N/A')}/100",
+                        "",
+                    ])
+                
+                # 价格位置
+                if price_data:
+                    bias_status = price_data.get('bias_status', 'N/A')
+                    bias_emoji = "✅" if bias_status == "安全" else ("⚠️" if bias_status == "警戒" else "🚨")
+                    report_lines.extend([
+                        "| 价格指标 | 数值 |",
+                        "|---------|------|",
+                        f"| 当前价 | {price_data.get('current_price', 'N/A')} |",
+                        f"| MA5 | {price_data.get('ma5', 'N/A')} |",
+                        f"| MA10 | {price_data.get('ma10', 'N/A')} |",
+                        f"| MA20 | {price_data.get('ma20', 'N/A')} |",
+                        f"| 乖离率(MA5) | {price_data.get('bias_ma5', 'N/A')}% {bias_emoji}{bias_status} |",
+                        f"| 支撑位 | {price_data.get('support_level', 'N/A')} |",
+                        f"| 压力位 | {price_data.get('resistance_level', 'N/A')} |",
+                        "",
+                    ])
+                
+                # 量能分析
+                if vol_data:
+                    report_lines.extend([
+                        f"**量能**: 量比 {vol_data.get('volume_ratio', 'N/A')} ({vol_data.get('volume_status', '')}) | 换手率 {vol_data.get('turnover_rate', 'N/A')}%",
+                        f"💡 *{vol_data.get('volume_meaning', '')}*",
+                        "",
+                    ])
+                
+                # 筹码结构
+                if chip_data:
+                    chip_health = chip_data.get('chip_health', 'N/A')
+                    chip_emoji = "✅" if chip_health == "健康" else ("⚠️" if chip_health == "一般" else "🚨")
+                    report_lines.extend([
+                        f"**筹码**: 获利比例 {chip_data.get('profit_ratio', 'N/A')} | 平均成本 {chip_data.get('avg_cost', 'N/A')} | 集中度 {chip_data.get('concentration', 'N/A')} {chip_emoji}{chip_health}",
+                        "",
+                    ])
+            
+            # 舆情情报已移至顶部显示
+            
+            # ========== 作战计划 ==========
+            battle = self._as_dict(dashboard.get('battle_plan', {}))
+            if battle:
+                report_lines.extend([
+                    "### 🎯 作战计划",
+                    "",
+                ])
+                
+                # 狙击点位
+                sniper = self._as_dict(battle.get('sniper_points', {}))
+                if sniper:
+                    report_lines.extend([
+                        "**📍 狙击点位**",
+                        "",
+                        "| 点位类型 | 价格 |",
+                        "|---------|------|",
+                        f"| 🎯 理想买入点 | {sniper.get('ideal_buy', 'N/A')} |",
+                        f"| 🔵 次优买入点 | {sniper.get('secondary_buy', 'N/A')} |",
+                        f"| 🛑 止损位 | {sniper.get('stop_loss', 'N/A')} |",
+                        f"| 🎊 目标位 | {sniper.get('take_profit', 'N/A')} |",
+                        "",
+                    ])
+                
+                # 仓位策略
+                position = self._as_dict(battle.get('position_strategy', {}))
+                if position:
+                    report_lines.extend([
+                        f"**💰 仓位建议**: {position.get('suggested_position', 'N/A')}",
+                        f"- 建仓策略: {position.get('entry_plan', 'N/A')}",
+                        f"- 风控策略: {position.get('risk_control', 'N/A')}",
+                        "",
+                    ])
+                
+                # 检查清单
+                checklist = battle.get('action_checklist', []) if battle else []
+                checklist = checklist if isinstance(checklist, list) else []
+                checklist = checklist if isinstance(checklist, list) else []
+                if checklist:
+                    report_lines.extend([
+                        "**✅ 检查清单**",
+                        "",
+                    ])
+                    for item in checklist:
+                        report_lines.append(f"- {item}")
+                    report_lines.append("")
+
+            # ========== 策略执行扩展（强制展示） ==========
+            report_lines.extend(self._build_execution_framework_lines(result, dashboard))
+            
+            # 如果没有 dashboard，显示传统格式
+            if not dashboard:
+                # 操作理由
+                if result.buy_reason:
+                    report_lines.extend([
+                        f"**💡 操作理由**: {result.buy_reason}",
+                        "",
+                    ])
+                
+                # 风险提示
+                if result.risk_warning:
+                    report_lines.extend([
+                        f"**⚠️ 风险提示**: {result.risk_warning}",
+                        "",
+                    ])
+                
+                # 技术面分析
+                if result.ma_analysis or result.volume_analysis:
+                    report_lines.extend([
+                        "### 📊 技术面",
+                        "",
+                    ])
+                    if result.ma_analysis:
+                        report_lines.append(f"**均线**: {result.ma_analysis}")
+                    if result.volume_analysis:
+                        report_lines.append(f"**量能**: {result.volume_analysis}")
+                    report_lines.append("")
+                
+                # 消息面
+                if result.news_summary:
+                    report_lines.extend([
+                        "### 📰 消息面",
+                        f"{result.news_summary}",
+                        "",
+                    ])
+            
             report_lines.extend([
                 "---",
                 "",
@@ -1473,23 +1211,100 @@ class NotificationService:
     def generate_single_stock_report(self, result: AnalysisResult) -> str:
         """
         生成单只股票的分析报告（用于单股推送模式 #55）
-        """
-        return self.generate_single_stock_report_v2(result)
-
-    def generate_single_stock_report_v2(self, result: AnalysisResult) -> str:
-        """
-        模板化 V2 单股报告，专业克制风格，三市场统一结构。
+        
+        格式精简但信息完整，适合每分析完一只股票立即推送
+        
+        Args:
+            result: 单只股票的分析结果
+            
+        Returns:
+            Markdown 格式的单股报告
         """
         report_date = datetime.now().strftime('%Y-%m-%d %H:%M')
-        lines: List[str] = [
-            f"# 个股分析报告 | {report_date}",
+        signal_text, signal_emoji, _ = self._get_signal_level(result)
+        dashboard = self._as_dict(getattr(result, "dashboard", None))
+        core = self._as_dict(dashboard.get('core_conclusion', {}))
+        battle = self._as_dict(dashboard.get('battle_plan', {}))
+        intel = self._as_dict(dashboard.get('intelligence', {}))
+        
+        # 股票名称
+        stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+        
+        lines = [
+            f"## {signal_emoji} {stock_name} ({result.code})",
+            "",
+            f"> {report_date} | 评分: **{result.sentiment_score}** | {result.trend_prediction}",
             "",
         ]
-        lines.extend(self.generate_template_stock_section(result))
+        
+        # 核心决策（一句话）
+        one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
+        if one_sentence:
+            lines.extend([
+                "### 📌 核心结论",
+                "",
+                f"**{signal_text}**: {one_sentence}",
+                f"- 操作建议: {self._get_effective_operation_advice(result) or result.operation_advice}",
+                "",
+            ])
+
+        # AI理解层（软建议，不覆盖硬风控）
+        before_ai_lines = len(lines)
+        self._append_discretionary_section(lines, dashboard)
+        if len(lines) == before_ai_lines:
+            self._append_discretionary_fallback(lines, result, dashboard)
+        
+        # 重要信息（舆情+基本面）：统一改为表格样式
+        intel_rows = self._build_intel_table_rows(intel, result) if intel else []
+        if intel_rows:
+            lines.extend([
+                "### 📰 重要信息速览",
+                "",
+                "| 类别 | 内容 |",
+                "|---|---|",
+            ])
+            for k, v in intel_rows:
+                if self._is_missing_text(v):
+                    continue
+                lines.append(f"| {k} | {v} |")
+            lines.append("")
+        
+        # 狙击点位
+        sniper = self._as_dict(battle.get('sniper_points', {})) if battle else {}
+        if sniper:
+            lines.extend([
+                "### 🎯 操作点位",
+                "",
+                "| 买点 | 止损 | 目标 |",
+                "|------|------|------|",
+            ])
+            ideal_buy = sniper.get('ideal_buy', '-')
+            stop_loss = sniper.get('stop_loss', '-')
+            take_profit = sniper.get('take_profit', '-')
+            lines.append(f"| {ideal_buy} | {stop_loss} | {take_profit} |")
+            lines.append("")
+
+        lines.extend(self._build_execution_framework_lines(result, dashboard))
+        
+        # 持仓建议
+        pos_advice = self._as_dict(core.get('position_advice', {})) if core else {}
+        if pos_advice:
+            lines.extend([
+                "### 💼 持仓建议",
+                "",
+                f"- 🆕 **空仓者**: {pos_advice.get('no_position', result.operation_advice)}",
+                f"- 💼 **持仓者**: {pos_advice.get('has_position', '继续持有')}",
+                "",
+            ])
+
+        # 用户持仓视角（个股 + 组合）
+        self._append_user_position_section(lines, result, dashboard)
+        
         lines.extend([
             "---",
             "*AI生成，仅供参考，不构成投资建议*",
         ])
+        
         return "\n".join(lines)
 
     def _append_user_position_section(

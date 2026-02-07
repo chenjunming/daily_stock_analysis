@@ -965,17 +965,12 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
             "- 必须输出 dashboard.discretionary_advice.free_judgement 与 action_suggestion。",
             "- action_suggestion 必须可执行：包含触发条件、仓位建议、风控要点；并体现剑宗/气宗配比与对应动作。",
             "- 必须给出明确操作倾向（买入/加仓/持有/减仓/卖出/观望其一），不能只给模糊描述。",
-            "- 必须输出 dashboard.template_blocks.growth_drivers（3-4条，每条包含 driver + signal）。",
-            "- 必须输出 dashboard.template_blocks.month_scenarios（乐观/中性/悲观，包含 probability + price_range + trigger）。",
-            "- 必须输出 dashboard.template_blocks.technical_levels（至少 strong_support/strong_resistance）。",
-            "- 必须输出 dashboard.template_blocks.operation_playbook，至少包含：passive_hold / active_adjust / range_strategy / stop_loss / invalidation。",
             "- company_analysis / valuation_snapshot / expectation_gap 应优先使用已给上下文推断，不要轻易输出“无法判断（数据不足）”。",
             "- 以上字段禁止返回空字符串/N/A/null；若无法确定，写“无法判断（数据不足）”。",
-            "- 可选返回 dashboard.template_blocks（position_snapshot/fundamental_snapshot/institutional_view/technical_levels/growth_drivers/month_scenarios/operation_playbook/risk_items），用于模板化个股报告渲染。",
             "",
             "最小 JSON 结构（可补充字段）：",
             "{\"stock_name\":\"\",\"sentiment_score\":0,\"trend_prediction\":\"\",\"operation_advice\":\"\",\"decision_type\":\"\",\"confidence_level\":\"\","
-            "\"dashboard\":{\"core_conclusion\":{},\"data_perspective\":{},\"intelligence\":{\"industry_boom\":{\"level\":\"\",\"cycle_phase\":\"\",\"evidence\":\"\"},\"company_analysis\":{\"positioning\":\"\",\"growth_quality\":\"\",\"core_risks\":\"\"},\"valuation_snapshot\":{\"valuation_conclusion\":\"\",\"pe_pb_ps_percentile\":\"\",\"vs_industry_percentile\":\"\"},\"expectation_gap\":{\"gap_verdict\":\"\",\"market_expectation\":\"\",\"company_guidance\":\"\"}},\"battle_plan\":{},\"user_position_advice\":{},\"portfolio_risk_advice\":{},\"strategy_execution\":{\"final_gate\":{},\"execution_plan\":{\"buy_size_pct\":\"\",\"sell_size_pct\":\"\",\"position_plan\":\"\",\"add_reduce_triggers\":\"\",\"invalidation\":\"\"}},\"discretionary_advice\":{\"free_judgement\":\"\",\"action_suggestion\":\"\",\"confidence\":\"\",\"thesis\":\"\",\"counter_view\":\"\",\"invalidation\":\"\",\"alt_plan\":\"\",\"note\":\"\"},\"template_blocks\":{\"position_snapshot\":{},\"fundamental_snapshot\":{},\"institutional_view\":{},\"technical_levels\":{},\"growth_drivers\":[{\"driver\":\"\",\"signal\":\"\"}],\"month_scenarios\":[{\"name\":\"乐观\",\"probability\":\"\",\"price_range\":\"\",\"trigger\":\"\"},{\"name\":\"中性\",\"probability\":\"\",\"price_range\":\"\",\"trigger\":\"\"},{\"name\":\"悲观\",\"probability\":\"\",\"price_range\":\"\",\"trigger\":\"\"}],\"operation_playbook\":{\"passive_hold\":\"\",\"active_adjust\":\"\",\"range_strategy\":\"\",\"stop_loss\":\"\",\"invalidation\":\"\"},\"risk_items\":[]}},"
+            "\"dashboard\":{\"core_conclusion\":{},\"data_perspective\":{},\"intelligence\":{\"industry_boom\":{\"level\":\"\",\"cycle_phase\":\"\",\"evidence\":\"\"},\"company_analysis\":{\"positioning\":\"\",\"growth_quality\":\"\",\"core_risks\":\"\"},\"valuation_snapshot\":{\"valuation_conclusion\":\"\",\"pe_pb_ps_percentile\":\"\",\"vs_industry_percentile\":\"\"},\"expectation_gap\":{\"gap_verdict\":\"\",\"market_expectation\":\"\",\"company_guidance\":\"\"}},\"battle_plan\":{},\"user_position_advice\":{},\"portfolio_risk_advice\":{},\"strategy_execution\":{\"final_gate\":{},\"execution_plan\":{\"buy_size_pct\":\"\",\"sell_size_pct\":\"\",\"position_plan\":\"\",\"add_reduce_triggers\":\"\",\"invalidation\":\"\"}},\"discretionary_advice\":{\"free_judgement\":\"\",\"action_suggestion\":\"\",\"confidence\":\"\",\"thesis\":\"\",\"counter_view\":\"\",\"invalidation\":\"\",\"alt_plan\":\"\",\"note\":\"\"}},"
             "\"analysis_summary\":\"\",\"key_points\":\"\",\"risk_warning\":\"\",\"buy_reason\":\"\"}",
         ])
 
@@ -1381,89 +1376,12 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         industry["cycle_phase"] = _pick(industry.get("cycle_phase"), payload.get("trend_prediction"))
         industry["evidence"] = _pick(industry.get("evidence"), payload.get("news_summary"))
 
-        # 模板化区块回填（供 V2 报告渲染）
-        template_blocks = _as_dict(dash.get("template_blocks", {}))
-        pos_snapshot = _as_dict(template_blocks.get("position_snapshot", {}))
-        fund_snapshot = _as_dict(template_blocks.get("fundamental_snapshot", {}))
-        inst_view = _as_dict(template_blocks.get("institutional_view", {}))
-        tech_levels = _as_dict(template_blocks.get("technical_levels", {}))
-        operation_playbook = _as_dict(template_blocks.get("operation_playbook", {}))
-
-        pos_snapshot["market_cap"] = _pick(
-            pos_snapshot.get("market_cap"),
-            payload.get("market_cap"),
-            intel.get("market_cap"),
-        )
-        pos_snapshot["pe_ttm"] = _pick(
-            pos_snapshot.get("pe_ttm"),
-            payload.get("pe_ttm"),
-            payload.get("pe_ratio"),
-            intel.get("pe_ratio"),
-        )
-        pos_snapshot["pb"] = _pick(
-            pos_snapshot.get("pb"),
-            payload.get("pb"),
-            payload.get("pb_ratio"),
-            intel.get("pb_ratio"),
-        )
-
-        fund_snapshot["annual_summary"] = _pick(
-            fund_snapshot.get("annual_summary"),
-            payload.get("fundamental_analysis"),
-            payload.get("analysis_summary"),
-        )
-        fund_snapshot["business_highlights"] = fund_snapshot.get("business_highlights") or [
-            _pick(payload.get("company_highlights"), company.get("growth_quality"))
-        ]
-        fund_snapshot["business_structure"] = fund_snapshot.get("business_structure") or [
-            _pick(company.get("positioning"), payload.get("sector_position"))
-        ]
-
-        inst_view["consensus_view"] = _pick(
-            inst_view.get("consensus_view"),
-            valuation.get("valuation_conclusion"),
-            gap.get("gap_verdict"),
-        )
-        data_persp_local = _as_dict(dash.get("data_perspective", {}))
-        price_pos_local = _as_dict(data_persp_local.get("price_position", {}))
-        tech_levels["strong_support"] = _pick(tech_levels.get("strong_support"), price_pos_local.get("support_level"))
-        tech_levels["strong_resistance"] = _pick(tech_levels.get("strong_resistance"), price_pos_local.get("resistance_level"))
-        operation_playbook["stop_loss"] = _pick(
-            operation_playbook.get("stop_loss"),
-            _as_dict(_as_dict(dash.get("battle_plan", {})).get("sniper_points", {})).get("stop_loss"),
-            _as_dict(_as_dict(dash.get("data_perspective", {})).get("price_position", {})).get("support_level"),
-        )
-
-        growth_drivers = template_blocks.get("growth_drivers")
-        if not isinstance(growth_drivers, list) or not growth_drivers:
-            growth_drivers = [x for x in [
-                _pick(payload.get("hot_topics"), payload.get("news_summary")),
-                _pick(company.get("growth_quality"), payload.get("company_highlights")),
-            ] if x and ("无法判断" not in str(x))]
-
-        risk_items = template_blocks.get("risk_items")
-        if not isinstance(risk_items, list) or not risk_items:
-            risk_items = [x for x in [
-                _pick(payload.get("risk_warning"), company.get("core_risks")),
-            ] if x and ("无法判断" not in str(x))]
-
-        template_blocks["position_snapshot"] = pos_snapshot
-        template_blocks["fundamental_snapshot"] = fund_snapshot
-        template_blocks["institutional_view"] = inst_view
-        template_blocks["technical_levels"] = tech_levels
-        template_blocks["operation_playbook"] = operation_playbook
-        template_blocks["growth_drivers"] = growth_drivers
-        if not isinstance(template_blocks.get("month_scenarios"), list):
-            template_blocks["month_scenarios"] = []
-        template_blocks["risk_items"] = risk_items
-
         intel["industry_boom"] = industry
         intel["company_analysis"] = company
         intel["valuation_snapshot"] = valuation
         intel["expectation_gap"] = gap
         dash["intelligence"] = intel
         dash["discretionary_advice"] = discretionary
-        dash["template_blocks"] = template_blocks
         return dash
 
     @staticmethod
@@ -1519,28 +1437,6 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         strategy["capital_flow"] = _as_dict(strategy.get("capital_flow", {}))
         strategy["scenario_playbook"] = _as_dict(strategy.get("scenario_playbook", {}))
 
-        template_raw = dash.get("template_blocks", {})
-        template_blocks = _as_dict(template_raw)
-        if not template_blocks and template_raw:
-            template_blocks = {"fundamental_snapshot": {"summary": _as_text(template_raw)}}
-        template_blocks["position_snapshot"] = _as_dict(template_blocks.get("position_snapshot", {}))
-        template_blocks["fundamental_snapshot"] = _as_dict(template_blocks.get("fundamental_snapshot", {}))
-        template_blocks["institutional_view"] = _as_dict(template_blocks.get("institutional_view", {}))
-        template_blocks["technical_levels"] = _as_dict(template_blocks.get("technical_levels", {}))
-        template_blocks["operation_playbook"] = _as_dict(template_blocks.get("operation_playbook", {}))
-
-        for k in ("growth_drivers", "month_scenarios", "risk_items"):
-            raw = template_blocks.get(k, [])
-            if isinstance(raw, list):
-                continue
-            if raw is None:
-                template_blocks[k] = []
-            elif isinstance(raw, str):
-                text = raw.strip()
-                template_blocks[k] = [text] if text else []
-            else:
-                template_blocks[k] = [str(raw)]
-
         dash["core_conclusion"] = core
         dash["data_perspective"] = data_persp
         dash["battle_plan"] = battle
@@ -1548,7 +1444,6 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         dash["portfolio_risk_advice"] = _as_dict(dash.get("portfolio_risk_advice", {}))
         dash["strategy_execution"] = strategy
         dash["discretionary_advice"] = _as_dict(dash.get("discretionary_advice", {}))
-        dash["template_blocks"] = template_blocks
         return dash
 
     def _harden_analysis_result(self, result: AnalysisResult) -> AnalysisResult:
