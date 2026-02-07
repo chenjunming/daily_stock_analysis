@@ -623,10 +623,62 @@ class NotificationService:
         text = str(value).strip()
         if not text:
             return True
-        # 统一将“无法判断/数据不足”视为缺失，避免直接把占位词展示给用户
-        if ("无法判断" in text) or ("数据不足" in text):
+        # 统一将“无法判断/数据不足/数据缺失”视为缺失，避免直接把占位词展示给用户
+        if ("无法判断" in text) or ("数据不足" in text) or ("数据缺失" in text):
+            return True
+        if "仅从技术面判断" in text:
             return True
         return text.upper() in {"N/A", "NA", "NONE", "NULL", "-", "--"}
+
+    @staticmethod
+    def _split_points(value: Any, max_points: int = 3) -> List[str]:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        def _strip_index_prefix(raw: str) -> str:
+            p = str(raw or "").strip()
+            return re.sub(r"^(?:\d+\s*[\)\.、]\s*)+", "", p).strip()
+        normalized = (
+            text.replace("\n", "；")
+            .replace("\r", "；")
+            .replace("|", "；")
+            .replace("。", "；")
+            .replace(";", "；")
+        )
+        points: List[str] = []
+        for raw in normalized.split("；"):
+            p = _strip_index_prefix(raw.strip().lstrip("-•").strip())
+            if not p:
+                continue
+            if p not in points:
+                points.append(p)
+            if len(points) >= max_points:
+                break
+        return points
+
+    @staticmethod
+    def _format_intel_table_cell(value: Any) -> str:
+        """
+        将“重要信息速览”内容格式化为多行显示，避免单元格过长难读。
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        parts: List[str] = []
+        for line in text.split("\n"):
+            for seg in line.split("；"):
+                p = seg.strip()
+                if p:
+                    parts.append(p.replace("|", "\\|"))
+        if not parts:
+            return text.replace("|", "\\|")
+        return "<br>".join(parts)
+
+    @staticmethod
+    def _numbered_points(points: List[str]) -> str:
+        clean = [str(p or "").strip() for p in (points or []) if str(p or "").strip()]
+        return "；".join(f"{i + 1}. {p}" for i, p in enumerate(clean))
 
     def _build_intel_table_rows(self, intel: Dict[str, Any], result: AnalysisResult) -> List[tuple]:
         """
@@ -644,11 +696,20 @@ class NotificationService:
             level = _clean(industry_boom.get('level'))
             cycle = _clean(industry_boom.get('cycle_phase'))
             evidence = _clean(industry_boom.get('evidence'))
-            parts = [p for p in [f"{level}（周期:{cycle}）" if level and cycle else level, evidence] if p]
+            parts = []
+            if level:
+                parts.append(f"景气等级：{level}")
+            if cycle:
+                parts.append(f"周期阶段：{cycle}")
+            parts.extend(self._split_points(evidence, max_points=3))
             if parts:
                 rows.append(("行业景气", "；".join(parts)))
         elif hasattr(result, 'sector_position') and not self._is_missing_text(result.sector_position):
-            rows.append(("行业景气", self._short_text(result.sector_position, 220)))
+            fallback_parts = self._split_points(result.sector_position, max_points=3)
+            if fallback_parts:
+                rows.append(("行业景气", "；".join(fallback_parts)))
+            else:
+                rows.append(("行业景气", self._short_text(result.sector_position, 220)))
 
         company_analysis = intel.get('company_analysis', {})
         company_row_added = False
@@ -656,12 +717,25 @@ class NotificationService:
             positioning = _clean(company_analysis.get('positioning'))
             growth = _clean(company_analysis.get('growth_quality'))
             risks = _clean(company_analysis.get('core_risks'))
-            parts = [p for p in [positioning, growth, f"风险:{risks}" if risks else ""] if p]
+            parts = []
+            pos_points = self._split_points(positioning, max_points=3)
+            growth_points = self._split_points(growth, max_points=3)
+            risk_points = self._split_points(risks, max_points=3)
+            if pos_points:
+                parts.append(f"定位：{self._numbered_points(pos_points)}")
+            if growth_points:
+                parts.append(f"成长：{self._numbered_points(growth_points)}")
+            if risk_points:
+                parts.append(f"风险：{self._numbered_points(risk_points)}")
             if parts:
-                rows.append(("公司分析", " | ".join(parts)))
+                rows.append(("公司分析", "；".join(parts)))
                 company_row_added = True
         if (not company_row_added) and hasattr(result, 'company_highlights') and not self._is_missing_text(result.company_highlights):
-            rows.append(("公司分析", self._short_text(result.company_highlights, 220)))
+            fallback_points = self._split_points(result.company_highlights, max_points=3)
+            if fallback_points:
+                rows.append(("公司分析", "；".join(fallback_points)))
+            else:
+                rows.append(("公司分析", self._short_text(result.company_highlights, 220)))
 
         if not self._is_missing_text(intel.get('earnings_outlook')):
             rows.append(("财报/业绩", self._short_text(intel.get('earnings_outlook'), 220)))
@@ -806,7 +880,7 @@ class NotificationService:
                     for k, v in intel_rows:
                         if self._is_missing_text(v):
                             continue
-                        report_lines.append(f"| {k} | {v} |")
+                        report_lines.append(f"| {k} | {self._format_intel_table_cell(v)} |")
                     report_lines.append("")
             
             # ========== 核心结论 ==========
@@ -1266,7 +1340,7 @@ class NotificationService:
             for k, v in intel_rows:
                 if self._is_missing_text(v):
                     continue
-                lines.append(f"| {k} | {v} |")
+                lines.append(f"| {k} | {self._format_intel_table_cell(v)} |")
             lines.append("")
         
         # 狙击点位

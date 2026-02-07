@@ -12,6 +12,7 @@ A股自选股智能分析系统 - AI分析层
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -345,9 +346,9 @@ class GeminiAnalyzer:
 
 交易理念（必须遵守）：
 1) 先看市场流动性阈值，再做赛道判断；通过“现象级事件”与“自主可控/遥遥领先”双透镜定位高景气赛道。
-2) 组合分配默认：剑宗30% + 气宗70%。
-   - 剑宗（30%）：短期主升捕捉，跌破5日线优先考虑止盈/止损。
-   - 气宗（70%）：长期确定性持有，容忍20-30%回撤，遇极端短涨可减仓。
+2) 组合分配默认：短线交易仓30% + 趋势配置仓70%。
+   - 短线交易仓（30%）：短期主升捕捉，跌破5日线优先考虑止盈/止损。
+   - 趋势配置仓（70%）：长期确定性持有，容忍20-30%回撤，遇极端短涨可减仓。
 3) 个股量化评分模型权重：
    - 行业景气 25%
    - 业务纯度 25%
@@ -375,6 +376,18 @@ intelligence 强制结构（必须完整输出，字段不能为空）：
 - valuation_snapshot: {valuation_conclusion, pe_pb_ps_percentile, vs_industry_percentile}
 - expectation_gap: {gap_verdict, market_expectation, company_guidance}
 
+industry_boom 填写要求（必须遵守）：
+- level: 明确写“高景气/中景气/低景气”其一，并可补一句原因。
+- cycle_phase: 明确写“上行/筑底/高位震荡/下行”其一。
+- evidence: 必须写 2-3 条可验证依据（用“1) ...；2) ...；3) ...”），优先结合近期新闻催化、供需/订单、政策或资本开支。
+- 禁止写“行业分析数据缺失”“仅从技术面判断”等占位语；可在末尾补“置信度：高/中/低”。
+
+company_analysis 填写要求（必须遵守）：
+- positioning: 必须写 2-3 条（产品/份额/护城河/竞争格局）。
+- growth_quality: 必须写 2-3 条（收入利润趋势、订单能见度、现金流或资本开支效率）。
+- core_risks: 必须写 2-3 条（需求波动、价格压力、监管/地缘/执行风险）。
+- 三个字段都禁止“数据缺失/仅从技术面判断”这类占位语，优先结合已给上下文推断。
+
 discretionary_advice 强制结构（允许自由发挥，但必须给可执行建议）：
 - free_judgement: 结合现价/MA5/MA20/RSI/量能后的自由判断（1-2句）
 - action_suggestion: 下一步具体动作（触发条件 + 仓位建议 + 风险控制）
@@ -382,7 +395,7 @@ discretionary_advice 强制结构（允许自由发挥，但必须给可执行�
 strategy_execution.execution_plan 强制字段（必须给出明确仓位比例）：
 - buy_size_pct: 买入/加仓比例（如 "2%-4%"）
 - sell_size_pct: 减仓/卖出比例（如 "30%-50%"）
-- position_plan: 仓位执行说明（需体现剑宗/气宗）
+- position_plan: 仓位执行说明（需体现短线交易仓/趋势配置仓）
 - add_reduce_triggers: 加减仓触发条件
 - invalidation: 失效条件
 
@@ -962,8 +975,11 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
             "  * company_analysis.positioning",
             "  * valuation_snapshot.valuation_conclusion",
             "  * expectation_gap.gap_verdict",
+            "- industry_boom.evidence 必须包含 2-3 条要点，格式示例：1) ...；2) ...；3) ...。",
+            "- company_analysis.positioning / growth_quality / core_risks 每个字段必须包含 2-3 条要点。",
+            "- 禁止输出“行业分析数据缺失”“仅从技术面判断”等占位语。",
             "- 必须输出 dashboard.discretionary_advice.free_judgement 与 action_suggestion。",
-            "- action_suggestion 必须可执行：包含触发条件、仓位建议、风控要点；并体现剑宗/气宗配比与对应动作。",
+            "- action_suggestion 必须可执行：包含触发条件、仓位建议、风控要点；并体现短线交易仓/趋势配置仓配比与对应动作。",
             "- 必须给出明确操作倾向（买入/加仓/持有/减仓/卖出/观望其一），不能只给模糊描述。",
             "- company_analysis / valuation_snapshot / expectation_gap 应优先使用已给上下文推断，不要轻易输出“无法判断（数据不足）”。",
             "- 以上字段禁止返回空字符串/N/A/null；若无法确定，写“无法判断（数据不足）”。",
@@ -1240,6 +1256,8 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
             text = str(value or "").strip()
             if not text or text.upper() in {"N/A", "NA", "NULL", "NONE", "-"}:
                 return "无法判断（数据不足）"
+            if ("数据缺失" in text) or ("仅从技术面判断" in text):
+                return "无法判断（数据不足）"
             return text
 
         industry = _as_dict(intel.get("industry_boom", {}))
@@ -1247,15 +1265,35 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         valuation = _as_dict(intel.get("valuation_snapshot", {}))
         gap = _as_dict(intel.get("expectation_gap", {}))
 
+        industry_level = _v(industry.get("level"))
+        industry_cycle = _v(industry.get("cycle_phase"))
+        industry_evidence = GeminiAnalyzer._compose_industry_evidence(
+            level=industry_level,
+            cycle_phase=industry_cycle,
+            evidence=_v(industry.get("evidence")),
+            payload={},
+        )
         intel["industry_boom"] = {
-            "level": _v(industry.get("level")),
-            "cycle_phase": _v(industry.get("cycle_phase")),
-            "evidence": _v(industry.get("evidence")),
+            "level": industry_level,
+            "cycle_phase": industry_cycle,
+            "evidence": industry_evidence,
         }
+        company_positioning = GeminiAnalyzer._compose_brief_points(
+            text=_v(company.get("positioning")),
+            fallback_points=[],
+        )
+        company_growth = GeminiAnalyzer._compose_brief_points(
+            text=_v(company.get("growth_quality")),
+            fallback_points=[],
+        )
+        company_risks = GeminiAnalyzer._compose_brief_points(
+            text=_v(company.get("core_risks")),
+            fallback_points=[],
+        )
         intel["company_analysis"] = {
-            "positioning": _v(company.get("positioning")),
-            "growth_quality": _v(company.get("growth_quality")),
-            "core_risks": _v(company.get("core_risks")),
+            "positioning": company_positioning,
+            "growth_quality": company_growth,
+            "core_risks": company_risks,
         }
         intel["valuation_snapshot"] = {
             "valuation_conclusion": _v(valuation.get("valuation_conclusion")),
@@ -1292,7 +1330,7 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
             u = t.upper()
             if u in {"N/A", "NA", "NULL", "NONE", "-"}:
                 return True
-            return ("无法判断" in t) or ("数据不足" in t)
+            return ("无法判断" in t) or ("数据不足" in t) or ("数据缺失" in t) or ("仅从技术面判断" in t)
 
         def _pick(*candidates: Any) -> str:
             for c in candidates:
@@ -1310,21 +1348,45 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         discretionary = _as_dict(dash.get("discretionary_advice", {}))
 
         # 兼容旧字段，补齐新结构字段
-        company["positioning"] = _pick(
+        company_positioning_raw = _pick(
             company.get("positioning"),
             payload.get("company_highlights"),
             payload.get("fundamental_analysis"),
             intel.get("latest_news"),
         )
-        company["growth_quality"] = _pick(
+        company_growth_raw = _pick(
             company.get("growth_quality"),
             intel.get("earnings_outlook"),
             payload.get("analysis_summary"),
         )
-        company["core_risks"] = _pick(
+        company_risks_raw = _pick(
             company.get("core_risks"),
             payload.get("risk_warning"),
             "; ".join(str(x) for x in (intel.get("risk_alerts") or []) if x),
+        )
+        company["positioning"] = GeminiAnalyzer._compose_brief_points(
+            text=company_positioning_raw,
+            fallback_points=[
+                f"业务定位线索：{payload.get('company_highlights')}",
+                f"竞争与护城河线索：{payload.get('fundamental_analysis')}",
+                f"近期动态线索：{intel.get('latest_news')}",
+            ],
+        )
+        company["growth_quality"] = GeminiAnalyzer._compose_brief_points(
+            text=company_growth_raw,
+            fallback_points=[
+                f"业绩线索：{intel.get('earnings_outlook')}",
+                f"趋势线索：{payload.get('analysis_summary')}",
+                f"市场反馈：{payload.get('market_sentiment')}",
+            ],
+        )
+        company["core_risks"] = GeminiAnalyzer._compose_brief_points(
+            text=company_risks_raw,
+            fallback_points=[
+                f"风险提示：{payload.get('risk_warning')}",
+                f"风险事件：{'; '.join(str(x) for x in (intel.get('risk_alerts') or []) if x)}",
+                "重点跟踪需求波动、价格压力与执行偏差",
+            ],
         )
 
         valuation["valuation_conclusion"] = _pick(
@@ -1372,9 +1434,22 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
             "软建议仅作补充，不覆盖硬风控与最终闸门。",
         )
 
-        industry["level"] = _pick(industry.get("level"), payload.get("sector_position"))
-        industry["cycle_phase"] = _pick(industry.get("cycle_phase"), payload.get("trend_prediction"))
-        industry["evidence"] = _pick(industry.get("evidence"), payload.get("news_summary"))
+        industry_level = _pick(industry.get("level"), payload.get("sector_position"))
+        industry_cycle = _pick(industry.get("cycle_phase"), payload.get("trend_prediction"))
+        industry_evidence_raw = _pick(
+            industry.get("evidence"),
+            payload.get("news_summary"),
+            payload.get("analysis_summary"),
+            payload.get("trend_prediction"),
+        )
+        industry["level"] = industry_level
+        industry["cycle_phase"] = industry_cycle
+        industry["evidence"] = GeminiAnalyzer._compose_industry_evidence(
+            level=industry_level,
+            cycle_phase=industry_cycle,
+            evidence=industry_evidence_raw,
+            payload=payload,
+        )
 
         intel["industry_boom"] = industry
         intel["company_analysis"] = company
@@ -1383,6 +1458,147 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         dash["intelligence"] = intel
         dash["discretionary_advice"] = discretionary
         return dash
+
+    @staticmethod
+    def _compose_industry_evidence(level: Any, cycle_phase: Any, evidence: Any, payload: Dict[str, Any]) -> str:
+        """
+        将行业景气 evidence 统一为 2-3 条可读要点，避免过短/占位语。
+        """
+        def _is_missing(value: Any) -> bool:
+            t = str(value or "").strip()
+            if not t:
+                return True
+            u = t.upper()
+            if u in {"N/A", "NA", "NULL", "NONE", "-"}:
+                return True
+            return ("无法判断" in t) or ("数据不足" in t) or ("数据缺失" in t) or ("仅从技术面判断" in t)
+
+        def _short(value: Any, max_len: int = 52) -> str:
+            t = str(value or "").strip().replace("\n", " ").replace("\r", " ")
+            if len(t) > max_len:
+                return t[:max_len] + "..."
+            return t
+
+        def _strip_index_prefix(value: str) -> str:
+            p = str(value or "").strip()
+            # 去除前缀编号，避免出现 "1) 1) xxx"
+            return re.sub(r"^(?:\d+\s*[\)\.、]\s*)+", "", p).strip()
+
+        points: List[str] = []
+        raw_text = str(evidence or "").strip()
+        normalized = (
+            raw_text.replace("\n", "；")
+            .replace("\r", "；")
+            .replace("|", "；")
+            .replace("。", "；")
+            .replace(";", "；")
+        )
+        for raw in normalized.split("；"):
+            p = _strip_index_prefix(raw.strip().lstrip("-•").strip())
+            if not p:
+                continue
+            if p not in points:
+                points.append(p)
+            if len(points) >= 3:
+                break
+
+        if len(points) < 2 and not _is_missing(level):
+            points.append(f"景气等级判断：{_short(level)}")
+        if len(points) < 2 and not _is_missing(cycle_phase):
+            points.append(f"周期阶段观察：{_short(cycle_phase)}")
+        if len(points) < 3 and not _is_missing(payload.get("news_summary")):
+            points.append(f"催化线索：{_short(payload.get('news_summary'))}")
+        if len(points) < 3 and not _is_missing(payload.get("market_sentiment")):
+            points.append(f"市场定价反馈：{_short(payload.get('market_sentiment'))}")
+        if len(points) < 3 and not _is_missing(payload.get("analysis_summary")):
+            points.append(f"景气跟踪重点：{_short(payload.get('analysis_summary'))}")
+
+        deduped: List[str] = []
+        for p in points:
+            clean_p = _strip_index_prefix(p)
+            if clean_p and (clean_p not in deduped):
+                deduped.append(clean_p)
+            if len(deduped) >= 3:
+                break
+
+        if not deduped:
+            deduped = [
+                "需求与订单边际变化需持续跟踪",
+                "价格与库存节奏决定景气持续性",
+                "政策与资本开支是下一阶段关键变量",
+            ]
+        elif len(deduped) == 1:
+            deduped.append("需结合供需与政策变量二次验证")
+            deduped.append("关注订单兑现与库存拐点信号")
+        elif len(deduped) == 2:
+            deduped.append("持续跟踪催化兑现节奏与景气延续性")
+
+        return "；".join(deduped[:3])
+
+    @staticmethod
+    def _compose_brief_points(text: Any, fallback_points: List[str]) -> str:
+        """
+        将任意短文本规范为 2-3 条要点，适用于公司分析等字段。
+        """
+        def _is_missing(value: Any) -> bool:
+            t = str(value or "").strip()
+            if not t:
+                return True
+            u = t.upper()
+            if u in {"N/A", "NA", "NULL", "NONE", "-"}:
+                return True
+            return ("无法判断" in t) or ("数据不足" in t) or ("数据缺失" in t) or ("仅从技术面判断" in t)
+
+        def _short(value: Any, max_len: int = 52) -> str:
+            t = str(value or "").strip().replace("\n", " ").replace("\r", " ")
+            if len(t) > max_len:
+                return t[:max_len] + "..."
+            return t
+
+        def _strip_index_prefix(value: str) -> str:
+            p = str(value or "").strip()
+            return re.sub(r"^(?:\d+\s*[\)\.、]\s*)+", "", p).strip()
+
+        points: List[str] = []
+        raw = str(text or "").strip()
+        normalized = (
+            raw.replace("\n", "；")
+            .replace("\r", "；")
+            .replace("|", "；")
+            .replace("。", "；")
+            .replace(";", "；")
+        )
+        for item in normalized.split("；"):
+            p = _strip_index_prefix(item.strip().lstrip("-•").strip())
+            if not p:
+                continue
+            if p not in points:
+                points.append(p)
+            if len(points) >= 3:
+                break
+
+        for fb in (fallback_points or []):
+            if len(points) >= 3:
+                break
+            if _is_missing(fb):
+                continue
+            p = _strip_index_prefix(_short(fb))
+            if p and p not in points:
+                points.append(p)
+
+        if not points:
+            points = [
+                "需补充经营与竞争数据后再提高结论置信度",
+                "优先跟踪订单兑现、利润率与现金流表现",
+                "结合管理层执行与行业景气同步验证",
+            ]
+        elif len(points) == 1:
+            points.append("需结合财报与订单数据做二次确认")
+            points.append("关注经营质量与执行节奏的持续性")
+        elif len(points) == 2:
+            points.append("持续跟踪关键变量兑现情况")
+
+        return "；".join(points[:3])
 
     @staticmethod
     def _normalize_dashboard_shape(dashboard: Any) -> Dict[str, Any]:
