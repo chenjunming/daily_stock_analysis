@@ -80,11 +80,17 @@ class BotMessage:
         if not text.startswith(prefix):
             # 尝试匹配中文命令（无前缀）
             chinese_commands = {
+                '重新分析': 'reanalyze',
                 '分析': 'analyze',
                 '大盘': 'market',
                 '批量': 'batch',
+                '历史': 'history',
                 '帮助': 'help',
                 '状态': 'status',
+                '自选': 'watchlist',
+                '删除': 'watchlist',
+                '持仓': 'position',
+                '仓位': 'position',
             }
             for cn_cmd, en_cmd in chinese_commands.items():
                 if text.startswith(cn_cmd):

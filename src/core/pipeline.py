@@ -14,8 +14,8 @@ A股自选股智能分析系统 - 核心分析流水线
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
-from typing import List, Dict, Any, Optional, Tuple
+from datetime import date, datetime
+from typing import List, Dict, Any, Optional, Tuple, Callable
 
 from src.config import get_config, Config
 from src.storage import get_db
@@ -49,7 +49,8 @@ class StockAnalysisPipeline:
         source_message: Optional[BotMessage] = None,
         query_id: Optional[str] = None,
         query_source: Optional[str] = None,
-        save_context_snapshot: Optional[bool] = None
+        save_context_snapshot: Optional[bool] = None,
+        progress_reporter: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         """
         初始化调度器
@@ -66,6 +67,7 @@ class StockAnalysisPipeline:
         self.save_context_snapshot = (
             self.config.save_context_snapshot if save_context_snapshot is None else save_context_snapshot
         )
+        self.progress_reporter = progress_reporter
         
         # 初始化各模块
         self.db = get_db()
@@ -97,6 +99,21 @@ class StockAnalysisPipeline:
             logger.info("搜索服务已启用 (Tavily/SerpAPI)")
         else:
             logger.warning("搜索服务未启用（未配置 API Key）")
+
+    def _report_progress(self, stage: str, detail: str, percent: int, code: Optional[str] = None) -> None:
+        if not self.progress_reporter:
+            return
+        try:
+            self.progress_reporter({
+                "stage": stage,
+                "detail": detail,
+                "percent": int(percent),
+                "code": code,
+                "query_id": self.query_id,
+                "timestamp": datetime.now().isoformat(),
+            })
+        except Exception as e:
+            logger.debug(f"进度上报失败: {e}")
     
     def fetch_and_save_stock_data(
         self, 
@@ -119,11 +136,13 @@ class StockAnalysisPipeline:
             Tuple[是否成功, 错误信息]
         """
         try:
+            self._report_progress("fetch_start", f"{code} 开始获取行情", 10, code=code)
             today = date.today()
             
             # 断点续传检查：如果今日数据已存在，跳过
             if not force_refresh and self.db.has_today_data(code, today):
                 logger.info(f"[{code}] 今日数据已存在，跳过获取（断点续传）")
+                self._report_progress("fetch_skip", f"{code} 已有当日数据", 20, code=code)
                 return True, None
             
             # 从数据源获取数据
@@ -131,17 +150,20 @@ class StockAnalysisPipeline:
             df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
             
             if df is None or df.empty:
+                self._report_progress("fetch_empty", f"{code} 数据为空", 20, code=code)
                 return False, "获取数据为空"
             
             # 保存到数据库
             saved_count = self.db.save_daily_data(df, code, source_name)
             logger.info(f"[{code}] 数据保存成功（来源: {source_name}，新增 {saved_count} 条）")
+            self._report_progress("fetch_done", f"{code} 数据就绪（{source_name}）", 25, code=code)
             
             return True, None
             
         except Exception as e:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"[{code}] {error_msg}")
+            self._report_progress("fetch_error", f"{code} 取数失败: {str(e)[:100]}", 25, code=code)
             return False, error_msg
     
     def analyze_stock(self, code: str, report_type: ReportType) -> Optional[AnalysisResult]:
@@ -164,12 +186,14 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None（如果分析失败）
         """
         try:
+            self._report_progress("analyze_prepare", f"{code} 准备分析", 35, code=code)
             # 获取股票名称（优先从实时行情获取真实名称）
             stock_name = STOCK_NAME_MAP.get(code, '')
             
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
             try:
+                self._report_progress("realtime_quote", f"{code} 获取实时行情", 40, code=code)
                 realtime_quote = self.fetcher_manager.get_realtime_quote(code)
                 if realtime_quote:
                     # 使用实时行情返回的真实股票名称
@@ -193,6 +217,7 @@ class StockAnalysisPipeline:
             # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
             chip_data = None
             try:
+                self._report_progress("chip_fetch", f"{code} 获取筹码分布", 45, code=code)
                 chip_data = self.fetcher_manager.get_chip_distribution(code)
                 if chip_data:
                     logger.info(f"[{code}] 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
@@ -205,6 +230,7 @@ class StockAnalysisPipeline:
             # Step 3: 趋势分析（基于交易理念）
             trend_result: Optional[TrendAnalysisResult] = None
             try:
+                self._report_progress("trend_calc", f"{code} 计算趋势信号", 50, code=code)
                 # 获取历史数据进行趋势分析
                 context = self.db.get_analysis_context(code)
                 if context and 'raw_data' in context:
@@ -221,6 +247,7 @@ class StockAnalysisPipeline:
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
             if self.search_service.is_available:
+                self._report_progress("intel_search_start", f"{code} 搜索情报", 60, code=code)
                 logger.info(f"[{code}] 开始多维度情报搜索...")
                 
                 # 使用多维度搜索（最多5次搜索）
@@ -238,6 +265,7 @@ class StockAnalysisPipeline:
                     )
                     logger.info(f"[{code}] 情报搜索完成: 共 {total_results} 条结果")
                     logger.debug(f"[{code}] 情报搜索结果:\n{news_context}")
+                    self._report_progress("intel_search_done", f"{code} 情报搜索完成", 72, code=code)
 
                     # 保存新闻情报到数据库（用于后续复盘与查询）
                     try:
@@ -256,6 +284,7 @@ class StockAnalysisPipeline:
                         logger.warning(f"[{code}] 保存新闻情报失败: {e}")
             else:
                 logger.info(f"[{code}] 搜索服务不可用，跳过情报搜索")
+                self._report_progress("intel_skip", f"{code} 跳过情报搜索", 70, code=code)
             
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
@@ -273,20 +302,32 @@ class StockAnalysisPipeline:
                 }
             
             # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
+            owner_key = self._build_owner_key()
+            latest_prices = {}
+            if realtime_quote and getattr(realtime_quote, "price", None):
+                latest_prices[code] = float(realtime_quote.price)
+            portfolio_profile = self.db.get_portfolio_profile(owner_key, latest_prices=latest_prices) if owner_key else {}
+            user_holding = self._build_user_holding(owner_key, code, latest_prices.get(code), context)
+
             enhanced_context = self._enhance_context(
                 context, 
                 realtime_quote, 
                 chip_data, 
                 trend_result,
-                stock_name  # 传入股票名称
+                stock_name,  # 传入股票名称
+                user_holding=user_holding,
+                portfolio_profile=portfolio_profile
             )
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
+            self._report_progress("llm_start", f"{code} AI 分析中", 82, code=code)
             result = self.analyzer.analyze(enhanced_context, news_context=news_context)
+            self._report_progress("llm_done", f"{code} AI 分析完成", 92, code=code)
 
             # Step 8: 保存分析历史记录
             if result:
                 try:
+                    self._report_progress("history_save", f"{code} 写入分析历史", 96, code=code)
                     context_snapshot = self._build_context_snapshot(
                         enhanced_context=enhanced_context,
                         news_content=news_context,
@@ -304,11 +345,13 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"[{code}] 保存分析历史失败: {e}")
 
+            self._report_progress("analyze_done", f"{code} 分析完成", 100, code=code)
             return result
             
         except Exception as e:
             logger.error(f"[{code}] 分析失败: {e}")
             logger.exception(f"[{code}] 详细错误信息:")
+            self._report_progress("analyze_error", f"{code} 分析失败: {str(e)[:100]}", 100, code=code)
             return None
     
     def _enhance_context(
@@ -317,7 +360,9 @@ class StockAnalysisPipeline:
         realtime_quote,
         chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
-        stock_name: str = ""
+        stock_name: str = "",
+        user_holding: Optional[Dict[str, Any]] = None,
+        portfolio_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -388,8 +433,80 @@ class StockAnalysisPipeline:
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
             }
+
+        # 添加用户持仓上下文（按用户隔离）
+        if user_holding:
+            enhanced['user_holding'] = user_holding
+        if portfolio_profile and portfolio_profile.get("holding_count", 0) > 0:
+            enhanced['portfolio_profile'] = portfolio_profile
         
         return enhanced
+
+    def _build_owner_key(self) -> Optional[str]:
+        """
+        基于 source_message 生成用户隔离键。
+        """
+        if not self.source_message:
+            return None
+        platform = (self.source_message.platform or "").strip().lower()
+        user_id = (self.source_message.user_id or "").strip()
+        if not platform or not user_id:
+            return None
+        return f"{platform}:{user_id}".lower()
+
+    def _build_user_holding(
+        self,
+        owner_key: Optional[str],
+        code: str,
+        current_price: Optional[float],
+        context: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        构建单股持仓视角数据。
+        """
+        if not owner_key:
+            return None
+        row = self.db.get_holding(owner_key, code)
+        if row is None:
+            return None
+
+        price = current_price
+        if price is None:
+            today = context.get("today", {})
+            close = today.get("close")
+            if close is not None:
+                try:
+                    price = float(close)
+                except Exception:
+                    price = None
+
+        pnl_pct = None
+        if price is not None and row.avg_cost and row.avg_cost > 0:
+            pnl_pct = (price - row.avg_cost) / row.avg_cost * 100.0
+
+        # 由于 LLM 给出的止损位在分析后才出现，这里采用 MA20 作为预分析止损参考
+        ma20 = context.get("today", {}).get("ma20")
+        distance_to_ma20_stop_pct = None
+        if price and ma20:
+            try:
+                ma20_f = float(ma20)
+                if ma20_f > 0:
+                    distance_to_ma20_stop_pct = (price - ma20_f) / ma20_f * 100.0
+            except Exception:
+                distance_to_ma20_stop_pct = None
+
+        return {
+            "owner_key": owner_key,
+            "code": row.code,
+            "name": row.name,
+            "market": row.market,
+            "avg_cost": float(row.avg_cost),
+            "weight_pct": float(row.weight_pct),
+            "current_price": price,
+            "pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
+            "weight_contribution_pct": round((pnl_pct * float(row.weight_pct) / 100.0), 4) if pnl_pct is not None else None,
+            "distance_to_ma20_stop_pct": round(distance_to_ma20_stop_pct, 4) if distance_to_ma20_stop_pct is not None else None,
+        }
     
     def _describe_volume_ratio(self, volume_ratio: float) -> str:
         """
@@ -519,6 +636,7 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None
         """
         logger.info(f"========== 开始处理 {code} ==========")
+        self._report_progress("stock_start", f"开始处理 {code}", 5, code=code)
         
         try:
             # Step 1: 获取并保存数据
@@ -560,12 +678,16 @@ class StockAnalysisPipeline:
                             logger.warning(f"[{code}] 单股推送失败")
                     except Exception as e:
                         logger.error(f"[{code}] 单股推送异常: {e}")
+                self._report_progress("stock_done", f"{code} 处理完成", 100, code=code)
+            else:
+                self._report_progress("stock_failed", f"{code} 处理失败（空结果）", 100, code=code)
             
             return result
             
         except Exception as e:
             # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
+            self._report_progress("stock_error", f"{code} 异常: {str(e)[:100]}", 100, code=code)
             return None
     
     def run(

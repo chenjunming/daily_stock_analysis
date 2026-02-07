@@ -199,8 +199,20 @@ class AnalysisResult:
     raw_response: Optional[str] = None  # 原始响应（调试用）
     search_performed: bool = False  # 是否执行了联网搜索
     data_sources: str = ""  # 数据来源说明
+    user_holding: Optional[Dict[str, Any]] = None  # 用户当前标的持仓视角
+    portfolio_profile: Optional[Dict[str, Any]] = None  # 用户组合画像
     success: bool = True
     error_message: Optional[str] = None
+
+    @staticmethod
+    def _as_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            first = next((x for x in value if isinstance(x, dict)), None)
+            if isinstance(first, dict):
+                return first
+        return {}
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -231,41 +243,54 @@ class AnalysisResult:
             'risk_warning': self.risk_warning,
             'buy_reason': self.buy_reason,
             'search_performed': self.search_performed,
+            'user_holding': self.user_holding,
+            'portfolio_profile': self.portfolio_profile,
             'success': self.success,
             'error_message': self.error_message,
         }
     
     def get_core_conclusion(self) -> str:
         """获取核心结论（一句话）"""
-        if self.dashboard and 'core_conclusion' in self.dashboard:
-            return self.dashboard['core_conclusion'].get('one_sentence', self.analysis_summary)
+        dashboard = self._as_dict(self.dashboard)
+        core = self._as_dict(dashboard.get('core_conclusion'))
+        if core:
+            return str(core.get('one_sentence', self.analysis_summary) or self.analysis_summary)
         return self.analysis_summary
     
     def get_position_advice(self, has_position: bool = False) -> str:
         """获取持仓建议"""
-        if self.dashboard and 'core_conclusion' in self.dashboard:
-            pos_advice = self.dashboard['core_conclusion'].get('position_advice', {})
+        dashboard = self._as_dict(self.dashboard)
+        core = self._as_dict(dashboard.get('core_conclusion'))
+        if core:
+            pos_advice = self._as_dict(core.get('position_advice', {}))
             if has_position:
-                return pos_advice.get('has_position', self.operation_advice)
-            return pos_advice.get('no_position', self.operation_advice)
+                return str(pos_advice.get('has_position', self.operation_advice) or self.operation_advice)
+            return str(pos_advice.get('no_position', self.operation_advice) or self.operation_advice)
         return self.operation_advice
     
     def get_sniper_points(self) -> Dict[str, str]:
         """获取狙击点位"""
-        if self.dashboard and 'battle_plan' in self.dashboard:
-            return self.dashboard['battle_plan'].get('sniper_points', {})
-        return {}
+        dashboard = self._as_dict(self.dashboard)
+        battle = self._as_dict(dashboard.get('battle_plan'))
+        sniper = self._as_dict(battle.get('sniper_points'))
+        return sniper
     
     def get_checklist(self) -> List[str]:
         """获取检查清单"""
-        if self.dashboard and 'battle_plan' in self.dashboard:
-            return self.dashboard['battle_plan'].get('action_checklist', [])
+        dashboard = self._as_dict(self.dashboard)
+        battle = self._as_dict(dashboard.get('battle_plan'))
+        checklist = battle.get('action_checklist', [])
+        if isinstance(checklist, list):
+            return [str(x) for x in checklist if x is not None]
         return []
     
     def get_risk_alerts(self) -> List[str]:
         """获取风险警报"""
-        if self.dashboard and 'intelligence' in self.dashboard:
-            return self.dashboard['intelligence'].get('risk_alerts', [])
+        dashboard = self._as_dict(self.dashboard)
+        intel = self._as_dict(dashboard.get('intelligence'))
+        alerts = intel.get('risk_alerts', [])
+        if isinstance(alerts, list):
+            return [str(x) for x in alerts if x is not None]
         return []
     
     def get_emoji(self) -> str:
@@ -309,181 +334,62 @@ class GeminiAnalyzer:
     # 核心模块：核心结论 + 数据透视 + 舆情情报 + 作战计划
     # ========================================
     
-    SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析师，负责生成专业的【决策仪表盘】分析报告。
+    SYSTEM_PROMPT = """你是股票趋势交易分析师，输出严格 JSON（禁止 Markdown/解释性前后缀）。
 
-## 核心交易理念（必须严格遵守）
+硬约束：
+1) 不追高：bias_ma5 > 5% 时，不得给“买入/加仓”。
+2) 空头结构（MA5<MA10<MA20 且价在 MA20 下）不得给“买入/加仓”。
+3) 数据缺失时必须写“无法判断”，不能编造。
+4) 若给“减仓/卖出”，必须给价格触发位和减仓比例。
+5) 有用户持仓时，必须给单股动作+组合风控动作。
 
-### 1. 严进策略（不追高）
-- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
-- **乖离率公式**：(现价 - MA5) / MA5 × 100%
-- 乖离率 < 2%：最佳买点区间
-- 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+交易理念（必须遵守）：
+1) 先看市场流动性阈值，再做赛道判断；通过“现象级事件”与“自主可控/遥遥领先”双透镜定位高景气赛道。
+2) 组合分配默认：剑宗30% + 气宗70%。
+   - 剑宗（30%）：短期主升捕捉，跌破5日线优先考虑止盈/止损。
+   - 气宗（70%）：长期确定性持有，容忍20-30%回撤，遇极端短涨可减仓。
+3) 个股量化评分模型权重：
+   - 行业景气 25%
+   - 业务纯度 25%
+   - 历史估值位置 25%
+   - 细分龙头 10%
+   - 市场辨识度 10%
+4) 风险清单（解禁/减持/造假/事故等）必须扣分，严重时直接否决（不建议）。
+5) 必须先确认“赛道高景气”再启用评分模型，避免熊市误判。
+6) 最终结论必须结合用户既有规则（50DMA、RSI、量能、近72小时消息面），输出“通过/存疑/不建议”及替代执行方案。
 
-### 2. 趋势交易（顺势而为）
-- **多头排列必须条件**：MA5 > MA10 > MA20
-- 只做多头排列的股票，空头排列坚决不碰
-- 均线发散上行优于均线粘合
-- 趋势强度判断：看均线间距是否在扩大
+输出主字段必须包含：
+stock_name, sentiment_score, trend_prediction, operation_advice, decision_type, confidence_level,
+dashboard, analysis_summary, key_points, risk_warning, buy_reason。
 
-### 3. 效率优先（筹码结构）
-- 关注筹码集中度：90%集中度 < 15% 表示筹码集中
-- 获利比例分析：70-90% 获利盘时需警惕获利回吐
-- 平均成本与现价关系：现价高于平均成本 5-15% 为健康
+dashboard 至少包含：
+core_conclusion, data_perspective, intelligence, battle_plan, user_position_advice,
+portfolio_risk_advice, strategy_execution, discretionary_advice。
 
-### 4. 买点偏好（回踩支撑）
-- **最佳买点**：缩量回踩 MA5 获得支撑
-- **次优买点**：回踩 MA10 获得支撑
-- **观望情况**：跌破 MA20 时观望
+strategy_execution.final_gate.verdict 只能是：通过/存疑/不建议。
+若 verdict 为“存疑/不建议”，必须给 alternative_plan。
 
-### 5. 风险排查重点
-- 减持公告（股东、高管减持）
-- 业绩预亏/大幅下滑
-- 监管处罚/立案调查
-- 行业政策利空
-- 大额解禁
+intelligence 强制结构（必须完整输出，字段不能为空）：
+- industry_boom: {level, cycle_phase, evidence}
+- company_analysis: {positioning, growth_quality, core_risks}
+- valuation_snapshot: {valuation_conclusion, pe_pb_ps_percentile, vs_industry_percentile}
+- expectation_gap: {gap_verdict, market_expectation, company_guidance}
 
-## 输出格式：决策仪表盘 JSON
+discretionary_advice 强制结构（允许自由发挥，但必须给可执行建议）：
+- free_judgement: 结合现价/MA5/MA20/RSI/量能后的自由判断（1-2句）
+- action_suggestion: 下一步具体动作（触发条件 + 仓位建议 + 风险控制）
 
-请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
+strategy_execution.execution_plan 强制字段（必须给出明确仓位比例）：
+- buy_size_pct: 买入/加仓比例（如 "2%-4%"）
+- sell_size_pct: 减仓/卖出比例（如 "30%-50%"）
+- position_plan: 仓位执行说明（需体现剑宗/气宗）
+- add_reduce_triggers: 加减仓触发条件
+- invalidation: 失效条件
 
-```json
-{
-    "stock_name": "股票中文名称",
-    "sentiment_score": 0-100整数,
-    "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
-    "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
-    "decision_type": "buy/hold/sell",
-    "confidence_level": "高/中/低",
-
-    "dashboard": {
-        "core_conclusion": {
-            "one_sentence": "一句话核心结论（30字以内，直接告诉用户做什么）",
-            "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
-            "time_sensitivity": "立即行动/今日内/本周内/不急",
-            "position_advice": {
-                "no_position": "空仓者建议：具体操作指引",
-                "has_position": "持仓者建议：具体操作指引"
-            }
-        },
-
-        "data_perspective": {
-            "trend_status": {
-                "ma_alignment": "均线排列状态描述",
-                "is_bullish": true/false,
-                "trend_score": 0-100
-            },
-            "price_position": {
-                "current_price": 当前价格数值,
-                "ma5": MA5数值,
-                "ma10": MA10数值,
-                "ma20": MA20数值,
-                "bias_ma5": 乖离率百分比数值,
-                "bias_status": "安全/警戒/危险",
-                "support_level": 支撑位价格,
-                "resistance_level": 压力位价格
-            },
-            "volume_analysis": {
-                "volume_ratio": 量比数值,
-                "volume_status": "放量/缩量/平量",
-                "turnover_rate": 换手率百分比,
-                "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
-            },
-            "chip_structure": {
-                "profit_ratio": 获利比例,
-                "avg_cost": 平均成本,
-                "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕"
-            }
-        },
-
-        "intelligence": {
-            "latest_news": "【最新消息】近期重要新闻摘要",
-            "risk_alerts": ["风险点1：具体描述", "风险点2：具体描述"],
-            "positive_catalysts": ["利好1：具体描述", "利好2：具体描述"],
-            "earnings_outlook": "业绩预期分析（基于年报预告、业绩快报等）",
-            "sentiment_summary": "舆情情绪一句话总结"
-        },
-
-        "battle_plan": {
-            "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
-            },
-            "position_strategy": {
-                "suggested_position": "建议仓位：X成",
-                "entry_plan": "分批建仓策略描述",
-                "risk_control": "风控策略描述"
-            },
-            "action_checklist": [
-                "✅/⚠️/❌ 检查项1：多头排列",
-                "✅/⚠️/❌ 检查项2：乖离率<5%",
-                "✅/⚠️/❌ 检查项3：量能配合",
-                "✅/⚠️/❌ 检查项4：无重大利空",
-                "✅/⚠️/❌ 检查项5：筹码健康"
-            ]
-        }
-    },
-
-    "analysis_summary": "100字综合分析摘要",
-    "key_points": "3-5个核心看点，逗号分隔",
-    "risk_warning": "风险提示",
-    "buy_reason": "操作理由，引用交易理念",
-
-    "trend_analysis": "走势形态分析",
-    "short_term_outlook": "短期1-3日展望",
-    "medium_term_outlook": "中期1-2周展望",
-    "technical_analysis": "技术面综合分析",
-    "ma_analysis": "均线系统分析",
-    "volume_analysis": "量能分析",
-    "pattern_analysis": "K线形态分析",
-    "fundamental_analysis": "基本面分析",
-    "sector_position": "板块行业分析",
-    "company_highlights": "公司亮点/风险",
-    "news_summary": "新闻摘要",
-    "market_sentiment": "市场情绪",
-    "hot_topics": "相关热点",
-
-    "search_performed": true/false,
-    "data_sources": "数据来源说明"
-}
-```
-
-## 评分标准
-
-### 强烈买入（80-100分）：
-- ✅ 多头排列：MA5 > MA10 > MA20
-- ✅ 低乖离率：<2%，最佳买点
-- ✅ 缩量回调或放量突破
-- ✅ 筹码集中健康
-- ✅ 消息面有利好催化
-
-### 买入（60-79分）：
-- ✅ 多头排列或弱势多头
-- ✅ 乖离率 <5%
-- ✅ 量能正常
-- ⚪ 允许一项次要条件不满足
-
-### 观望（40-59分）：
-- ⚠️ 乖离率 >5%（追高风险）
-- ⚠️ 均线缠绕趋势不明
-- ⚠️ 有风险事件
-
-### 卖出/减仓（0-39分）：
-- ❌ 空头排列
-- ❌ 跌破MA20
-- ❌ 放量下跌
-- ❌ 重大利空
-
-## 决策仪表盘核心原则
-
-1. **核心结论先行**：一句话说清该买该卖
-2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **精确狙击点**：必须给出具体价格，不说模糊的话
-4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
-5. **风险优先级**：舆情中的风险点要醒目标出"""
+如果确实拿不到数据，不能写空字符串/N/A/null，统一写：
+“无法判断（数据不足）”。
+但仅在确实无法推断时使用；应优先结合已给技术面、新闻、公司信息做具体判断。
+"""
 
     def __init__(self, api_key: Optional[str] = None):
         """
@@ -680,7 +586,7 @@ class GeminiAnalyzer:
                         {"role": "user", "content": prompt}
                     ],
                     temperature=generation_config.get('temperature', config.openai_temperature),
-                    max_tokens=generation_config.get('max_output_tokens', 8192),
+                    max_tokens=generation_config.get('max_output_tokens', config.ai_max_output_tokens),
                 )
                 
                 if response and response.choices and response.choices[0].message.content:
@@ -874,7 +780,7 @@ class GeminiAnalyzer:
             config = get_config()
             generation_config = {
                 "temperature": config.gemini_temperature,
-                "max_output_tokens": 8192,
+                "max_output_tokens": config.ai_max_output_tokens,
             }
 
             # 根据实际使用的 API 显示日志
@@ -898,6 +804,8 @@ class GeminiAnalyzer:
             result = self._parse_response(response_text, code, name)
             result.raw_response = response_text
             result.search_performed = bool(news_context)
+            result.user_holding = context.get("user_holding")
+            result.portfolio_profile = context.get("portfolio_profile")
             
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
             
@@ -934,174 +842,149 @@ class GeminiAnalyzer:
             name: 股票名称（默认值，可能被上下文覆盖）
             news_context: 预先搜索的新闻内容
         """
+        cfg = get_config()
         code = context.get('code', 'Unknown')
-        
-        # 优先使用上下文中的股票名称（从 realtime_quote 获取）
+
         stock_name = context.get('stock_name', name)
         if not stock_name or stock_name == f'股票{code}':
             stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
-            
-        today = context.get('today', {})
-        
-        # ========== 构建决策仪表盘格式的输入 ==========
-        prompt = f"""# 决策仪表盘分析请求
 
-## 📊 股票基础信息
-| 项目 | 数据 |
-|------|------|
-| 股票代码 | **{code}** |
-| 股票名称 | **{stock_name}** |
-| 分析日期 | {context.get('date', '未知')} |
+        today = context.get('today') if isinstance(context.get('today'), dict) else {}
+        rt = context.get('realtime') if isinstance(context.get('realtime'), dict) else {}
+        chip = context.get('chip') if isinstance(context.get('chip'), dict) else {}
+        trend = context.get('trend_analysis') if isinstance(context.get('trend_analysis'), dict) else {}
+        rsi_val = today.get('rsi') or today.get('rsi12') or trend.get('rsi') or trend.get('rsi12')
+        holding = context.get('user_holding') if isinstance(context.get('user_holding'), dict) else {}
+        portfolio = context.get('portfolio_profile') if isinstance(context.get('portfolio_profile'), dict) else {}
+        market_dist = portfolio.get('market_distribution', {}) if isinstance(portfolio, dict) else {}
 
----
+        lines = [
+            f"任务: 为 {stock_name}({code}) 生成决策仪表盘 JSON。",
+            "规则: 严格 JSON 输出，不要 markdown 代码块，不要附加解释。",
+            "",
+            "【基础信息】",
+            f"- date: {context.get('date', '未知')}",
+            f"- code: {code}",
+            f"- stock_name: {stock_name}",
+            "",
+            "【技术面】",
+            f"- price: close={today.get('close')} open={today.get('open')} high={today.get('high')} low={today.get('low')} pct_chg={today.get('pct_chg')}",
+            f"- ma: ma5={today.get('ma5')} ma10={today.get('ma10')} ma20={today.get('ma20')} ma_status={context.get('ma_status')}",
+            f"- momentum: rsi={rsi_val}",
+            f"- volume: {self._format_volume(today.get('volume'))}, amount: {self._format_amount(today.get('amount'))}",
+        ]
 
-## 📈 技术面数据
+        if rt:
+            lines.extend([
+                "【实时增强】",
+                f"- rt_price={rt.get('price')} volume_ratio={rt.get('volume_ratio')} turnover_rate={rt.get('turnover_rate')}",
+                f"- pe={rt.get('pe_ratio')} pb={rt.get('pb_ratio')} mv={self._format_amount(rt.get('total_mv'))}",
+                f"- change_60d={rt.get('change_60d')}",
+            ])
 
-### 今日行情
-| 指标 | 数值 |
-|------|------|
-| 收盘价 | {today.get('close', 'N/A')} 元 |
-| 开盘价 | {today.get('open', 'N/A')} 元 |
-| 最高价 | {today.get('high', 'N/A')} 元 |
-| 最低价 | {today.get('low', 'N/A')} 元 |
-| 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
-| 成交量 | {self._format_volume(today.get('volume'))} |
-| 成交额 | {self._format_amount(today.get('amount'))} |
+        if chip:
+            lines.extend([
+                "【筹码】",
+                f"- profit_ratio={chip.get('profit_ratio')} avg_cost={chip.get('avg_cost')} c90={chip.get('concentration_90')} c70={chip.get('concentration_70')}",
+                f"- chip_status={chip.get('chip_status')}",
+            ])
 
-### 均线系统（关键判断指标）
-| 均线 | 数值 | 说明 |
-|------|------|------|
-| MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
-| MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
-| MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
-| 均线形态 | {context.get('ma_status', '未知')} | 多头/空头/缠绕 |
-"""
-        
-        # 添加实时行情数据（量比、换手率等）
-        if 'realtime' in context:
-            rt = context['realtime']
-            prompt += f"""
-### 实时行情增强数据
-| 指标 | 数值 | 解读 |
-|------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} 元 | |
-| **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
-| 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
-| 市净率 | {rt.get('pb_ratio', 'N/A')} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
-| 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
-"""
-        
-        # 添加筹码分布数据
-        if 'chip' in context:
-            chip = context['chip']
-            profit_ratio = chip.get('profit_ratio', 0)
-            prompt += f"""
-### 筹码分布数据（效率指标）
-| 指标 | 数值 | 健康标准 |
-|------|------|----------|
-| **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
-| 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
-| 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
-| 筹码状态 | {chip.get('chip_status', '未知')} | |
-"""
-        
-        # 添加趋势分析结果（基于交易理念的预判）
-        if 'trend_analysis' in context:
-            trend = context['trend_analysis']
-            bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
-            prompt += f"""
-### 趋势分析预判（基于交易理念）
-| 指标 | 数值 | 判定 |
-|------|------|------|
-| 趋势状态 | {trend.get('trend_status', '未知')} | |
-| 均线排列 | {trend.get('ma_alignment', '未知')} | MA5>MA10>MA20为多头 |
-| 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
-| **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
-| 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
-| 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
-| 系统信号 | {trend.get('buy_signal', '未知')} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+        if trend:
+            signal_reasons_raw = trend.get('signal_reasons')
+            if isinstance(signal_reasons_raw, list):
+                signal_reasons = [str(x) for x in signal_reasons_raw if x is not None]
+            elif signal_reasons_raw:
+                signal_reasons = [str(signal_reasons_raw)]
+            else:
+                signal_reasons = []
 
-#### 系统分析理由
-**买入理由**：
-{chr(10).join('- ' + r for r in trend.get('signal_reasons', ['无'])) if trend.get('signal_reasons') else '- 无'}
+            risk_factors_raw = trend.get('risk_factors')
+            if isinstance(risk_factors_raw, list):
+                risk_factors = [str(x) for x in risk_factors_raw if x is not None]
+            elif risk_factors_raw:
+                risk_factors = [str(risk_factors_raw)]
+            else:
+                risk_factors = []
 
-**风险因素**：
-{chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
-"""
-        
-        # 添加昨日对比数据
+            lines.extend([
+                "【趋势】",
+                f"- trend_status={trend.get('trend_status')} ma_alignment={trend.get('ma_alignment')} trend_strength={trend.get('trend_strength')}",
+                f"- bias_ma5={trend.get('bias_ma5')} bias_ma10={trend.get('bias_ma10')} volume_status={trend.get('volume_status')}",
+                f"- buy_signal={trend.get('buy_signal')} signal_score={trend.get('signal_score')}",
+                f"- signal_reasons={self._truncate_text('; '.join(signal_reasons), 220)}",
+                f"- risk_factors={self._truncate_text('; '.join(risk_factors), 220)}",
+            ])
+
         if 'yesterday' in context:
-            volume_change = context.get('volume_change_ratio', 'N/A')
-            prompt += f"""
-### 量价变化
-- 成交量较昨日变化：{volume_change}倍
-- 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
-"""
-        
-        # 添加新闻搜索结果（重点区域）
-        prompt += """
----
+            lines.extend([
+                "【日对比】",
+                f"- price_change_ratio={context.get('price_change_ratio')} volume_change_ratio={context.get('volume_change_ratio')}",
+            ])
 
-## 📰 舆情情报
-"""
-        if news_context:
-            prompt += f"""
-以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
-1. 🚨 **风险警报**：减持、处罚、利空
-2. 🎯 **利好催化**：业绩、合同、政策
-3. 📊 **业绩预期**：年报预告、业绩快报
+        if holding or portfolio:
+            top_rows = portfolio.get('top_holdings') if isinstance(portfolio, dict) else []
+            top_text = "; ".join(
+                f"{x.get('code')}:{x.get('weight_pct')}%"
+                for x in (top_rows or [])[:3]
+                if isinstance(x, dict)
+            )
+            lines.extend([
+                "【用户持仓】",
+                f"- has_holding={'yes' if holding else 'no'} avg_cost={holding.get('avg_cost')} pnl_pct={holding.get('pnl_pct')} weight_pct={holding.get('weight_pct')}",
+                f"- portfolio: holding_count={portfolio.get('holding_count')} total_weight={portfolio.get('total_weight_pct')} top3={portfolio.get('concentration_top3_pct')}",
+                f"- market_distribution: CN={market_dist.get('CN')} HK={market_dist.get('HK')} US={market_dist.get('US')}",
+                f"- top_holdings: {top_text or 'N/A'}",
+            ])
 
-```
-{news_context}
-```
-"""
+        trimmed_news = self._truncate_text(news_context or "", cfg.ai_news_context_max_chars)
+        lines.append("【舆情】")
+        if trimmed_news:
+            lines.append(trimmed_news)
         else:
-            prompt += """
-未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
-"""
+            lines.append("无近期新闻，优先技术面。")
 
-        # 注入缺失数据警告
         if context.get('data_missing'):
-            prompt += """
-⚠️ **数据缺失警告**
-由于接口限制，当前无法获取完整的实时行情和技术指标数据。
-请 **忽略上述表格中的 N/A 数据**，重点依据 **【📰 舆情情报】** 中的新闻进行基本面和情绪面分析。
-在回答技术面问题（如均线、乖离率）时，请直接说明“数据缺失，无法判断”，**严禁编造数据**。
-"""
-        
-        # 明确的输出要求
-        prompt += f"""
----
+            lines.append("【数据缺失警告】技术指标缺失处必须明确写“无法判断”。")
 
-## ✅ 分析任务
+        lines.extend([
+            "",
+            "【输出要求】",
+            "- 仅输出 JSON 对象。",
+            "- stock_name 必须是正确中文名（不要“股票代码”占位名）。",
+            "- operation_advice 若为减仓/卖出，必须给 reduce_price_trigger 与 reduce_plan。",
+            "- 必须给 today_action / today_trigger / today_order_plan。",
+            "- 必须给 strategy_execution.final_gate.verdict（通过/存疑/不建议）。",
+            "- verdict 为存疑/不建议时，必须给 alternative_plan。",
+            "- 必须给 battle_plan.sniper_points 的 ideal_buy/secondary_buy/stop_loss/take_profit。",
+            "- strategy_execution.execution_plan 必须给 buy_size_pct / sell_size_pct / position_plan / add_reduce_triggers / invalidation。",
+            "- intelligence 的四个子对象必须完整输出且关键字段非空：",
+            "  * industry_boom.level",
+            "  * company_analysis.positioning",
+            "  * valuation_snapshot.valuation_conclusion",
+            "  * expectation_gap.gap_verdict",
+            "- 必须输出 dashboard.discretionary_advice.free_judgement 与 action_suggestion。",
+            "- action_suggestion 必须可执行：包含触发条件、仓位建议、风控要点；并体现剑宗/气宗配比与对应动作。",
+            "- 必须给出明确操作倾向（买入/加仓/持有/减仓/卖出/观望其一），不能只给模糊描述。",
+            "- company_analysis / valuation_snapshot / expectation_gap 应优先使用已给上下文推断，不要轻易输出“无法判断（数据不足）”。",
+            "- 以上字段禁止返回空字符串/N/A/null；若无法确定，写“无法判断（数据不足）”。",
+            "",
+            "最小 JSON 结构（可补充字段）：",
+            "{\"stock_name\":\"\",\"sentiment_score\":0,\"trend_prediction\":\"\",\"operation_advice\":\"\",\"decision_type\":\"\",\"confidence_level\":\"\","
+            "\"dashboard\":{\"core_conclusion\":{},\"data_perspective\":{},\"intelligence\":{\"industry_boom\":{\"level\":\"\",\"cycle_phase\":\"\",\"evidence\":\"\"},\"company_analysis\":{\"positioning\":\"\",\"growth_quality\":\"\",\"core_risks\":\"\"},\"valuation_snapshot\":{\"valuation_conclusion\":\"\",\"pe_pb_ps_percentile\":\"\",\"vs_industry_percentile\":\"\"},\"expectation_gap\":{\"gap_verdict\":\"\",\"market_expectation\":\"\",\"company_guidance\":\"\"}},\"battle_plan\":{},\"user_position_advice\":{},\"portfolio_risk_advice\":{},\"strategy_execution\":{\"final_gate\":{},\"execution_plan\":{\"buy_size_pct\":\"\",\"sell_size_pct\":\"\",\"position_plan\":\"\",\"add_reduce_triggers\":\"\",\"invalidation\":\"\"}},\"discretionary_advice\":{\"free_judgement\":\"\",\"action_suggestion\":\"\",\"confidence\":\"\",\"thesis\":\"\",\"counter_view\":\"\",\"invalidation\":\"\",\"alt_plan\":\"\",\"note\":\"\"}},"
+            "\"analysis_summary\":\"\",\"key_points\":\"\",\"risk_warning\":\"\",\"buy_reason\":\"\"}",
+        ])
 
-请为 **{stock_name}({code})** 生成【决策仪表盘】，严格按照 JSON 格式输出。
+        prompt = "\n".join(lines)
+        return self._truncate_text(prompt, cfg.ai_prompt_max_chars)
 
-### ⚠️ 重要：股票名称确认
-如果上方显示的股票名称为"股票{code}"或不正确，请在分析开头**明确输出该股票的正确中文全称**。
-
-### 重点关注（必须明确回答）：
-1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
-2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
-3. ❓ 量能是否配合（缩量回调/放量突破）？
-4. ❓ 筹码结构是否健康？
-5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
-
-### 决策仪表盘要求：
-- **股票名称**：必须输出正确的中文全称（如"贵州茅台"而非"股票600519"）
-- **核心结论**：一句话说清该买/该卖/该等
-- **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
-- **具体狙击点位**：买入价、止损价、目标价（精确到分）
-- **检查清单**：每项用 ✅/⚠️/❌ 标记
-
-请输出完整的 JSON 格式决策仪表盘。"""
-        
-        return prompt
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        """按字符预算裁剪文本，避免 prompt 过长。"""
+        if not text:
+            return ""
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip()
     
     def _format_volume(self, volume: Optional[float]) -> str:
         """格式化成交量显示"""
@@ -1156,9 +1039,18 @@ class GeminiAnalyzer:
                 json_str = self._fix_json_string(json_str)
                 
                 data = json.loads(json_str)
+                if isinstance(data, list):
+                    # 某些模型会返回 [{...}]，这里做容错
+                    data = next((x for x in data if isinstance(x, dict)), {})
+                if not isinstance(data, dict):
+                    logger.warning("JSON 顶层非对象，降级为文本解析")
+                    return self._parse_text_response(response_text, code, name)
                 
                 # 提取 dashboard 数据
                 dashboard = data.get('dashboard', None)
+                dashboard = self._normalize_dashboard_intelligence(dashboard)
+                dashboard = self._enrich_dashboard_from_payload(dashboard, data)
+                dashboard = self._normalize_dashboard_shape(dashboard)
 
                 # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
                 ai_stock_name = data.get('stock_name')
@@ -1177,11 +1069,16 @@ class GeminiAnalyzer:
                     else:
                         decision_type = 'hold'
                 
-                return AnalysisResult(
+                raw_score = data.get('sentiment_score', 50)
+                normalized_score = self._normalize_sentiment_score(raw_score)
+                if str(raw_score) != str(normalized_score):
+                    logger.info(f"[评分归一] 原始sentiment_score={raw_score} -> 归一后={normalized_score}")
+
+                result = AnalysisResult(
                     code=code,
                     name=name,
                     # 核心指标
-                    sentiment_score=int(data.get('sentiment_score', 50)),
+                    sentiment_score=normalized_score,
                     trend_prediction=data.get('trend_prediction', '震荡'),
                     operation_advice=data.get('operation_advice', '持有'),
                     decision_type=decision_type,
@@ -1215,6 +1112,7 @@ class GeminiAnalyzer:
                     data_sources=data.get('data_sources', '技术面数据'),
                     success=True,
                 )
+                return self._harden_analysis_result(result)
             else:
                 # 没有找到 JSON，尝试从纯文本中提取信息
                 logger.warning(f"无法从响应中提取 JSON，使用原始文本分析")
@@ -1281,7 +1179,7 @@ class GeminiAnalyzer:
         # 截取前500字符作为摘要
         summary = response_text[:500] if response_text else '无分析结果'
         
-        return AnalysisResult(
+        result = AnalysisResult(
             code=code,
             name=name,
             sentiment_score=sentiment_score,
@@ -1295,6 +1193,351 @@ class GeminiAnalyzer:
             raw_response=response_text,
             success=True,
         )
+        return self._harden_analysis_result(result)
+
+    @staticmethod
+    def _normalize_sentiment_score(raw_score: Any) -> int:
+        """
+        将 AI 返回的评分统一归一到 0~100：
+        - 0~1 视为比例，乘 100
+        - 1~10 视为 10 分制，乘 10
+        - 10~100 视为百分制，直接使用
+        """
+        try:
+            v = float(raw_score)
+        except Exception:
+            return 50
+
+        if v < 0:
+            v = 0
+        if v <= 1:
+            v = v * 100.0
+        elif v <= 10:
+            v = v * 10.0
+        # >10 认为已经是百分制
+        if v > 100:
+            v = 100
+        return int(round(v))
+
+    @staticmethod
+    def _normalize_dashboard_intelligence(dashboard: Any) -> Dict[str, Any]:
+        """
+        规范化 dashboard.intelligence 结构，避免缺字段导致可靠性误判。
+        """
+        def _as_dict(value: Any) -> Dict[str, Any]:
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                first = next((x for x in value if isinstance(x, dict)), None)
+                if isinstance(first, dict):
+                    return first
+            return {}
+
+        dash = _as_dict(dashboard)
+        intel = _as_dict(dash.get("intelligence", {}))
+
+        def _v(value: Any) -> str:
+            text = str(value or "").strip()
+            if not text or text.upper() in {"N/A", "NA", "NULL", "NONE", "-"}:
+                return "无法判断（数据不足）"
+            return text
+
+        industry = _as_dict(intel.get("industry_boom", {}))
+        company = _as_dict(intel.get("company_analysis", {}))
+        valuation = _as_dict(intel.get("valuation_snapshot", {}))
+        gap = _as_dict(intel.get("expectation_gap", {}))
+
+        intel["industry_boom"] = {
+            "level": _v(industry.get("level")),
+            "cycle_phase": _v(industry.get("cycle_phase")),
+            "evidence": _v(industry.get("evidence")),
+        }
+        intel["company_analysis"] = {
+            "positioning": _v(company.get("positioning")),
+            "growth_quality": _v(company.get("growth_quality")),
+            "core_risks": _v(company.get("core_risks")),
+        }
+        intel["valuation_snapshot"] = {
+            "valuation_conclusion": _v(valuation.get("valuation_conclusion")),
+            "pe_pb_ps_percentile": _v(valuation.get("pe_pb_ps_percentile")),
+            "vs_industry_percentile": _v(valuation.get("vs_industry_percentile")),
+        }
+        intel["expectation_gap"] = {
+            "gap_verdict": _v(gap.get("gap_verdict")),
+            "market_expectation": _v(gap.get("market_expectation")),
+            "company_guidance": _v(gap.get("company_guidance")),
+        }
+
+        dash["intelligence"] = intel
+        return dash
+
+    @staticmethod
+    def _enrich_dashboard_from_payload(dashboard: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        使用模型已返回的其它字段，对 dashboard 缺失维度做二次回填，减少“无法判断”。
+        """
+        def _as_dict(value: Any) -> Dict[str, Any]:
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                first = next((x for x in value if isinstance(x, dict)), None)
+                if isinstance(first, dict):
+                    return first
+            return {}
+
+        def _is_missing(value: Any) -> bool:
+            t = str(value or "").strip()
+            if not t:
+                return True
+            u = t.upper()
+            if u in {"N/A", "NA", "NULL", "NONE", "-"}:
+                return True
+            return ("无法判断" in t) or ("数据不足" in t)
+
+        def _pick(*candidates: Any) -> str:
+            for c in candidates:
+                if not _is_missing(c):
+                    return str(c).strip()
+            return "无法判断（数据不足）"
+
+        dash = _as_dict(dashboard)
+        intel = _as_dict(dash.get("intelligence", {}))
+
+        industry = _as_dict(intel.get("industry_boom", {}))
+        company = _as_dict(intel.get("company_analysis", {}))
+        valuation = _as_dict(intel.get("valuation_snapshot", {}))
+        gap = _as_dict(intel.get("expectation_gap", {}))
+        discretionary = _as_dict(dash.get("discretionary_advice", {}))
+
+        # 兼容旧字段，补齐新结构字段
+        company["positioning"] = _pick(
+            company.get("positioning"),
+            payload.get("company_highlights"),
+            payload.get("fundamental_analysis"),
+            intel.get("latest_news"),
+        )
+        company["growth_quality"] = _pick(
+            company.get("growth_quality"),
+            intel.get("earnings_outlook"),
+            payload.get("analysis_summary"),
+        )
+        company["core_risks"] = _pick(
+            company.get("core_risks"),
+            payload.get("risk_warning"),
+            "; ".join(str(x) for x in (intel.get("risk_alerts") or []) if x),
+        )
+
+        valuation["valuation_conclusion"] = _pick(
+            valuation.get("valuation_conclusion"),
+            payload.get("fundamental_analysis"),
+            "估值结论需结合PE/PB/PS动态确认",
+        )
+        valuation["pe_pb_ps_percentile"] = _pick(
+            valuation.get("pe_pb_ps_percentile"),
+            intel.get("valuation_percentile"),
+        )
+        valuation["vs_industry_percentile"] = _pick(
+            valuation.get("vs_industry_percentile"),
+            intel.get("industry_valuation_percentile"),
+        )
+
+        score = GeminiAnalyzer._normalize_sentiment_score(payload.get("sentiment_score", 50))
+        gap["gap_verdict"] = _pick(
+            gap.get("gap_verdict"),
+            "预期偏乐观" if score >= 65 else ("预期中性" if score >= 45 else "预期偏谨慎"),
+        )
+        gap["market_expectation"] = _pick(
+            gap.get("market_expectation"),
+            payload.get("market_sentiment"),
+            intel.get("sentiment_summary"),
+        )
+        gap["company_guidance"] = _pick(
+            gap.get("company_guidance"),
+            intel.get("earnings_outlook"),
+            payload.get("news_summary"),
+        )
+
+        # 保底 AI 理解层，避免前端完全缺失
+        discretionary["free_judgement"] = _pick(
+            discretionary.get("free_judgement"),
+            payload.get("analysis_summary"),
+        )
+        discretionary["action_suggestion"] = _pick(
+            discretionary.get("action_suggestion"),
+            payload.get("buy_reason"),
+            f"当前建议：{payload.get('operation_advice') or '观望'}，按触发条件分批执行并严格风控。",
+        )
+        discretionary["note"] = _pick(
+            discretionary.get("note"),
+            "软建议仅作补充，不覆盖硬风控与最终闸门。",
+        )
+
+        industry["level"] = _pick(industry.get("level"), payload.get("sector_position"))
+        industry["cycle_phase"] = _pick(industry.get("cycle_phase"), payload.get("trend_prediction"))
+        industry["evidence"] = _pick(industry.get("evidence"), payload.get("news_summary"))
+
+        intel["industry_boom"] = industry
+        intel["company_analysis"] = company
+        intel["valuation_snapshot"] = valuation
+        intel["expectation_gap"] = gap
+        dash["intelligence"] = intel
+        dash["discretionary_advice"] = discretionary
+        return dash
+
+    @staticmethod
+    def _normalize_dashboard_shape(dashboard: Any) -> Dict[str, Any]:
+        """
+        统一 dashboard 结构，兼容模型把对象误返回成字符串/数组的情况。
+        """
+        def _as_dict(value: Any) -> Dict[str, Any]:
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                first = next((x for x in value if isinstance(x, dict)), None)
+                if isinstance(first, dict):
+                    return first
+            return {}
+
+        dash = _as_dict(dashboard)
+
+        def _as_text(value: Any, default: str = "") -> str:
+            if value is None:
+                return default
+            text = str(value).strip()
+            return text or default
+
+        core_raw = dash.get("core_conclusion", {})
+        core = _as_dict(core_raw)
+        if not core and core_raw:
+            core = {"one_sentence": _as_text(core_raw, "分析完成")}
+        core["position_advice"] = _as_dict(core.get("position_advice", {}))
+
+        data_raw = dash.get("data_perspective", {})
+        data_persp = _as_dict(data_raw)
+        if not data_persp and data_raw:
+            data_persp = {"summary": _as_text(data_raw)}
+        data_persp["trend_status"] = _as_dict(data_persp.get("trend_status", {}))
+        data_persp["price_position"] = _as_dict(data_persp.get("price_position", {}))
+        data_persp["volume_analysis"] = _as_dict(data_persp.get("volume_analysis", {}))
+        data_persp["chip_structure"] = _as_dict(data_persp.get("chip_structure", {}))
+
+        battle_raw = dash.get("battle_plan", {})
+        battle = _as_dict(battle_raw)
+        if not battle and battle_raw:
+            battle = {"summary": _as_text(battle_raw)}
+        battle["sniper_points"] = _as_dict(battle.get("sniper_points", {}))
+        battle["position_strategy"] = _as_dict(battle.get("position_strategy", {}))
+
+        strategy_raw = dash.get("strategy_execution", {})
+        strategy = _as_dict(strategy_raw)
+        if not strategy and strategy_raw:
+            strategy = {"execution_plan": {"position_plan": _as_text(strategy_raw)}}
+        strategy["final_gate"] = _as_dict(strategy.get("final_gate", {}))
+        strategy["execution_plan"] = _as_dict(strategy.get("execution_plan", {}))
+        strategy["capital_flow"] = _as_dict(strategy.get("capital_flow", {}))
+        strategy["scenario_playbook"] = _as_dict(strategy.get("scenario_playbook", {}))
+
+        dash["core_conclusion"] = core
+        dash["data_perspective"] = data_persp
+        dash["battle_plan"] = battle
+        dash["user_position_advice"] = _as_dict(dash.get("user_position_advice", {}))
+        dash["portfolio_risk_advice"] = _as_dict(dash.get("portfolio_risk_advice", {}))
+        dash["strategy_execution"] = strategy
+        dash["discretionary_advice"] = _as_dict(dash.get("discretionary_advice", {}))
+        return dash
+
+    def _harden_analysis_result(self, result: AnalysisResult) -> AnalysisResult:
+        """
+        结果可靠性加固：
+        - 统一 operation_advice 与 decision_type
+        - 与 final_gate 冲突时执行降级
+        - 关键维度缺失时，禁止激进建议并降低置信度
+        """
+        if result is None:
+            return result
+
+        dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+        strategy = dashboard.get("strategy_execution", {}) if isinstance(dashboard, dict) else {}
+        final_gate = strategy.get("final_gate", {}) if isinstance(strategy, dict) else {}
+        verdict = str(final_gate.get("verdict", "") or "").strip()
+
+        # 1) 建议归一化 + 决策类型同步
+        result.operation_advice = self._normalize_operation_advice(result.operation_advice)
+        result.decision_type = self._decision_type_from_advice(result.operation_advice)
+
+        # 2) 最终闸门冲突处理
+        if verdict == "不建议":
+            result.operation_advice = "观望"
+            result.decision_type = "hold"
+            if result.sentiment_score > 55:
+                result.sentiment_score = 55
+            result.confidence_level = "低"
+        elif verdict == "存疑" and result.operation_advice in {"买入", "加仓", "强烈买入"}:
+            result.operation_advice = "观望"
+            result.decision_type = "hold"
+            if result.sentiment_score > 60:
+                result.sentiment_score = 60
+
+        # 3) 关键维度完整性
+        intel = dashboard.get("intelligence", {}) if isinstance(dashboard, dict) else {}
+        missing = []
+        if not (isinstance(intel.get("industry_boom"), dict) and intel.get("industry_boom", {}).get("level")):
+            missing.append("industry_boom")
+        if not (isinstance(intel.get("company_analysis"), dict) and intel.get("company_analysis", {}).get("positioning")):
+            missing.append("company_analysis")
+        if not (isinstance(intel.get("valuation_snapshot"), dict) and intel.get("valuation_snapshot", {}).get("valuation_conclusion")):
+            missing.append("valuation_snapshot")
+        if not (isinstance(intel.get("expectation_gap"), dict) and intel.get("expectation_gap", {}).get("gap_verdict")):
+            missing.append("expectation_gap")
+
+        if missing:
+            if result.operation_advice in {"买入", "加仓", "强烈买入"}:
+                result.operation_advice = "观望"
+                result.decision_type = "hold"
+            if result.sentiment_score > 58:
+                result.sentiment_score = 58
+            result.confidence_level = "低"
+            note = f"关键维度缺失: {', '.join(missing[:6])}"
+            if isinstance(strategy, dict):
+                fg = dict(final_gate) if isinstance(final_gate, dict) else {}
+                fg["verdict"] = fg.get("verdict") or "存疑"
+                ap = str(fg.get("alternative_plan", "") or "").strip()
+                fg["alternative_plan"] = f"{ap}；{note}".strip("；")
+                strategy["final_gate"] = fg
+                dashboard["strategy_execution"] = strategy
+                result.dashboard = dashboard
+
+        return result
+
+    @staticmethod
+    def _normalize_operation_advice(advice: str) -> str:
+        t = str(advice or "").strip()
+        if not t:
+            return "观望"
+        if "强烈买入" in t or "强买" in t:
+            return "强烈买入"
+        if "买入" in t:
+            return "买入"
+        if "加仓" in t:
+            return "加仓"
+        if "持有" in t:
+            return "持有"
+        if "观望" in t:
+            return "观望"
+        if "减仓" in t:
+            return "减仓"
+        if "卖出" in t or "清仓" in t:
+            return "卖出"
+        return "观望"
+
+    @staticmethod
+    def _decision_type_from_advice(advice: str) -> str:
+        a = str(advice or "").strip()
+        if a in {"买入", "加仓", "强烈买入"}:
+            return "buy"
+        if a in {"卖出", "减仓", "强烈卖出"}:
+            return "sell"
+        return "hold"
     
     def batch_analyze(
         self, 

@@ -9,18 +9,13 @@
 
 import re
 import time
-from typing import List, Callable
+from typing import List, Callable, Dict, Any
 
 
 def format_feishu_markdown(content: str) -> str:
     """
-    将通用 Markdown 转换为飞书 lark_md 更友好的格式
-    
-    转换规则：
-    - 飞书不支持 Markdown 标题（# / ## / ###），用加粗代替
-    - 引用块使用前缀替代
-    - 分隔线统一为细线
-    - 表格转换为条目列表
+    将通用 Markdown 做轻量清洗，尽量保留原始结构。
+    注意：不要改写表格和标题，避免破坏用户可读性。
     
     Args:
         content: 原始 Markdown 内容
@@ -36,75 +31,54 @@ def format_feishu_markdown(content: str) -> str:
         💬 引用
         • 列1：值1 | 列2：值2
     """
-    def _flush_table_rows(buffer: List[str], output: List[str]) -> None:
-        """将表格缓冲区中的行转换为飞书格式"""
-        if not buffer:
-            return
+    text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
 
-        def _parse_row(row: str) -> List[str]:
-            """解析表格行，提取单元格"""
-            cells = [c.strip() for c in row.strip().strip('|').split('|')]
-            return [c for c in cells if c]
+    # 统一列表符号
+    text = re.sub(r'(?m)^\s*•\s+', '- ', text)
 
-        rows = []
-        for raw in buffer:
-            # 跳过分隔行（如 |---|---|）
-            if re.match(r'^\s*\|?\s*[:-]+\s*(\|\s*[:-]+\s*)+\|?\s*$', raw):
-                continue
-            parsed = _parse_row(raw)
-            if parsed:
-                rows.append(parsed)
+    # 合并过多空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
 
-        if not rows:
-            return
+    return text.strip()
 
-        header = rows[0]
-        data_rows = rows[1:] if len(rows) > 1 else []
-        for row in data_rows:
-            pairs = []
-            for idx, cell in enumerate(row):
-                key = header[idx] if idx < len(header) else f"列{idx + 1}"
-                pairs.append(f"{key}：{cell}")
-            output.append(f"• {' | '.join(pairs)}")
 
-    lines = []
-    table_buffer: List[str] = []
+def build_feishu_card_from_markdown(content: str, title: str = "A股智能分析报告") -> Dict[str, Any]:
+    """
+    将 Markdown 内容转换为飞书交互卡片结构。
+    使用 JSON 2.0 的 markdown 组件，保留标题/表格/代码块等语法。
+    """
+    text = format_feishu_markdown(content)
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title}
+        },
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": text or "（空内容）",
+                "text_align": "left",
+                "text_size": "normal",
+            }]
+        },
+    }
 
-    for raw_line in content.splitlines():
-        line = raw_line.rstrip()
 
-        # 处理表格行
-        if line.strip().startswith('|'):
-            table_buffer.append(line)
-            continue
-
-        # 刷新表格缓冲区
-        if table_buffer:
-            _flush_table_rows(table_buffer, lines)
-            table_buffer = []
-
-        # 转换标题（# ## ### 等）
-        if re.match(r'^#{1,6}\s+', line):
-            title = re.sub(r'^#{1,6}\s+', '', line).strip()
-            line = f"**{title}**" if title else ""
-        # 转换引用块
-        elif line.startswith('> '):
-            quote = line[2:].strip()
-            line = f"💬 {quote}" if quote else ""
-        # 转换分隔线
-        elif line.strip() == '---':
-            line = '────────'
-        # 转换列表项
-        elif line.startswith('- '):
-            line = f"• {line[2:].strip()}"
-
-        lines.append(line)
-
-    # 处理末尾的表格
-    if table_buffer:
-        _flush_table_rows(table_buffer, lines)
-
-    return "\n".join(lines).strip()
+def infer_report_title(content: str, default: str = "A股智能分析报告") -> str:
+    """
+    根据正文内容推断更准确的卡片标题。
+    """
+    s = (content or "").upper()
+    if "今日操作模板" in s or "大盘复盘" in s:
+        if "美股" in s or " US" in s or "| US" in s:
+            return "美股智能分析报告"
+        if "港股" in s or "| HK" in s:
+            return "港股智能分析报告"
+        if "A股" in s or "| CN" in s:
+            return "A股智能分析报告"
+        return "市场复盘报告"
+    return default
 
 
 def _chunk_by_lines(content: str, max_bytes: int, send_func: Callable[[str], bool]) -> bool:
@@ -180,19 +154,6 @@ def chunk_feishu_content(content: str, max_bytes: int, send_func: Callable[[str]
         """获取字符串的 UTF-8 字节数"""
         return len(s.encode('utf-8'))
     
-    def _truncate_to_bytes(text: str, max_bytes: int) -> str:
-        """按字节截断文本，确保不会在多字节字符中间截断"""
-        encoded = text.encode('utf-8')
-        if len(encoded) <= max_bytes:
-            return text
-        
-        # 从最大字节数开始向前查找，找到完整的 UTF-8 字符边界
-        truncated = encoded[:max_bytes]
-        while truncated and (truncated[-1] & 0xC0) == 0x80:
-            truncated = truncated[:-1]
-        
-        return truncated.decode('utf-8', errors='ignore')
-    
     # 智能分割：优先按 "---" 分隔（股票之间的分隔线）
     # 如果没有分隔线，按 "### " 标题分割（每只股票的标题）
     if "\n---\n" in content:
@@ -215,19 +176,9 @@ def chunk_feishu_content(content: str, max_bytes: int, send_func: Callable[[str]
     for section in sections:
         section_bytes = get_bytes(section) + separator_bytes
         
-        # 如果单个 section 就超长，需要强制截断
+        # 如果单个 section 超长，回退到按行分片（不做截断）
         if section_bytes > max_bytes:
-            # 先发送当前积累的内容
-            if current_chunk:
-                chunks.append(separator.join(current_chunk))
-                current_chunk = []
-                current_bytes = 0
-            
-            # 强制截断这个超长 section（按字节截断）
-            truncated = _truncate_to_bytes(section, max_bytes - 200)
-            truncated += "\n\n...(本段内容过长已截断)"
-            chunks.append(truncated)
-            continue
+            return _chunk_by_lines(content, max_bytes, send_func)
         
         # 检查加入后是否超长
         if current_bytes + section_bytes > max_bytes:

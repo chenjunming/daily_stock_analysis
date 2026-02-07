@@ -311,6 +311,12 @@ def create_default_router() -> Router:
     )
 
     router.register(
+        "/analysis/batch", "GET",
+        lambda q: api_handler.handle_batch_analysis(q),
+        "批量触发股票分析"
+    )
+
+    router.register(
         "/analysis/history", "GET",
         lambda q: api_handler.handle_analysis_history(q),
         "查询分析历史"
@@ -326,6 +332,37 @@ def create_default_router() -> Router:
         "/task", "GET",
         lambda q: api_handler.handle_task_status(q),
         "查询任务状态"
+    )
+    
+    # === Watchlist 自选股相关路由 ===
+    router.register(
+        "/watchlist/add", "GET",
+        lambda q: api_handler.handle_watchlist_add(q),
+        "添加自选股"
+    )
+    
+    router.register(
+        "/watchlist/remove", "GET",
+        lambda q: api_handler.handle_watchlist_remove(q),
+        "删除自选股"
+    )
+    
+    router.register(
+        "/watchlist/list", "GET",
+        lambda q: api_handler.handle_watchlist_list(q),
+        "获取自选股列表"
+    )
+    
+    router.register(
+        "/stock/analysis", "GET",
+        lambda q: api_handler.handle_stock_analysis(q),
+        "获取股票分析历史"
+    )
+
+    router.register(
+        "/watchlist/search", "GET",
+        lambda q: api_handler.handle_watchlist_search(q),
+        "股票模糊搜索"
     )
     
     # === Bot Webhook 路由 ===

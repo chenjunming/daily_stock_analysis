@@ -62,6 +62,7 @@ class MACDStatus(Enum):
     GOLDEN_CROSS_ZERO = "零轴上金叉"      # DIF上穿DEA，且在零轴上方
     GOLDEN_CROSS = "金叉"                # DIF上穿DEA
     BULLISH = "多头"                    # DIF>DEA>0
+    NEUTRAL = "中性"                    # DIF/DEA 在零轴附近震荡
     CROSSING_UP = "上穿零轴"             # DIF上穿零轴
     CROSSING_DOWN = "下穿零轴"           # DIF下穿零轴
     BEARISH = "空头"                    # DIF<DEA<0
@@ -114,7 +115,7 @@ class TrendAnalysisResult:
     macd_dif: float = 0.0          # DIF 快线
     macd_dea: float = 0.0          # DEA 慢线
     macd_bar: float = 0.0           # MACD 柱状图
-    macd_status: MACDStatus = MACDStatus.BULLISH
+    macd_status: MACDStatus = MACDStatus.NEUTRAL
     macd_signal: str = ""            # MACD 信号描述
 
     # RSI 指标
@@ -536,8 +537,8 @@ class StockTrendAnalyzer:
             result.macd_status = MACDStatus.BEARISH
             result.macd_signal = "⚠ 空头排列，持续下跌"
         else:
-            result.macd_status = MACDStatus.BULLISH
-            result.macd_signal = " MACD 中性区域"
+            result.macd_status = MACDStatus.NEUTRAL
+            result.macd_signal = "MACD 中性区域，方向不明"
 
     def _analyze_rsi(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
@@ -666,6 +667,7 @@ class StockTrendAnalyzer:
             MACDStatus.GOLDEN_CROSS: 12,      # 金叉
             MACDStatus.CROSSING_UP: 10,       # 上穿零轴
             MACDStatus.BULLISH: 8,            # 多头
+            MACDStatus.NEUTRAL: 4,            # 中性
             MACDStatus.BEARISH: 2,            # 空头
             MACDStatus.CROSSING_DOWN: 0,       # 下穿零轴
             MACDStatus.DEATH_CROSS: 0,        # 死叉
@@ -677,8 +679,10 @@ class StockTrendAnalyzer:
             reasons.append(f"✅ {result.macd_signal}")
         elif result.macd_status in [MACDStatus.DEATH_CROSS, MACDStatus.CROSSING_DOWN]:
             risks.append(f"⚠️ {result.macd_signal}")
-        else:
+        elif result.macd_status in [MACDStatus.BULLISH, MACDStatus.CROSSING_UP]:
             reasons.append(result.macd_signal)
+        else:
+            risks.append(f"⚠️ {result.macd_signal}")
 
         # === RSI 评分（10分）===
         rsi_scores = {
@@ -698,24 +702,81 @@ class StockTrendAnalyzer:
         else:
             reasons.append(result.rsi_signal)
 
+        # === 风控扣分（避免追涨杀跌）===
+        if result.bias_ma5 > self.BIAS_THRESHOLD:
+            score -= 10
+            risks.append(f"⚠️ 价格偏离MA5过高({result.bias_ma5:.1f}%)，禁止追高")
+
+        bearish_states = {
+            MACDStatus.BEARISH,
+            MACDStatus.CROSSING_DOWN,
+            MACDStatus.DEATH_CROSS,
+        }
+        if result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR] and result.current_price < result.ma20:
+            score -= 10
+            risks.append("⚠️ 空头趋势且位于MA20下方，优先防守")
+
+        if result.rsi_status == RSIStatus.OVERBOUGHT:
+            score -= 6
+            risks.append("⚠️ 短线超买，避免高位接力")
+
+        # 仅在趋势健康时，超卖才作为正向信号；下跌趋势中防止“抄底抄在半山腰”
+        if (
+            result.rsi_status == RSIStatus.OVERSOLD
+            and result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR, TrendStatus.WEAK_BEAR]
+            and result.macd_status in bearish_states
+        ):
+            score -= 8
+            risks.append("⚠️ 超卖+空头共振，存在下跌中继风险")
+
         # === 综合判断 ===
+        score = max(0, min(100, score))
         result.signal_score = score
         result.signal_reasons = reasons
         result.risk_factors = risks
 
-        # 生成买入信号（调整阈值以适应新的100分制）
-        if score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+        # 生成信号：先风控闸门，再按分值分层
+        bearish_trend = result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]
+        weak_bear_break_ma20 = (
+            result.trend_status == TrendStatus.WEAK_BEAR
+            and result.current_price < result.ma20
+            and result.macd_status in bearish_states
+        )
+        has_trend_reversal = (
+            result.macd_status in [MACDStatus.GOLDEN_CROSS_ZERO, MACDStatus.CROSSING_UP]
+            and result.current_price >= result.ma20
+            and result.rsi_12 >= 40
+        )
+
+        if bearish_trend:
+            if has_trend_reversal:
+                result.buy_signal = BuySignal.WAIT
+            elif result.trend_status == TrendStatus.STRONG_BEAR or result.current_price < result.ma20:
+                result.buy_signal = BuySignal.STRONG_SELL
+            else:
+                result.buy_signal = BuySignal.SELL
+        elif weak_bear_break_ma20:
+            result.buy_signal = BuySignal.SELL
+        elif score >= 80 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
             result.buy_signal = BuySignal.STRONG_BUY
-        elif score >= 60 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
+        elif (
+            score >= 68
+            and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]
+            and result.bias_ma5 <= self.BIAS_THRESHOLD
+            and result.rsi_status != RSIStatus.OVERBOUGHT
+        ):
             result.buy_signal = BuySignal.BUY
-        elif score >= 45:
+        elif score >= 52:
             result.buy_signal = BuySignal.HOLD
-        elif score >= 30:
+        elif score >= 36:
             result.buy_signal = BuySignal.WAIT
-        elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
-            result.buy_signal = BuySignal.STRONG_SELL
         else:
             result.buy_signal = BuySignal.SELL
+
+        # 追高与超买不允许输出买入类信号
+        if result.buy_signal in [BuySignal.STRONG_BUY, BuySignal.BUY]:
+            if result.bias_ma5 > self.BIAS_THRESHOLD or result.rsi_status == RSIStatus.OVERBOUGHT:
+                result.buy_signal = BuySignal.WAIT
     
     def format_analysis(self, result: TrendAnalysisResult) -> str:
         """

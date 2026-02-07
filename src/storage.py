@@ -16,8 +16,9 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +36,7 @@ from sqlalchemy import (
     select,
     and_,
     desc,
+    text,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -175,6 +177,48 @@ class NewsIntel(Base):
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
 
 
+class Watchlist(Base):
+    """
+    自选股列表模型
+    
+    支持按市场分组（A股、港股、美股）
+    """
+    __tablename__ = 'watchlist'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # 股票代码
+    code = Column(String(10), nullable=False, unique=True, index=True)
+    
+    # 股票名称
+    name = Column(String(50))
+    
+    # 市场类型: CN（A股）、HK（港股）、US（美股）
+    market = Column(String(10), nullable=False, index=True)
+    
+    # 排序权重（小的优先显示）
+    order_key = Column(Integer, default=0)
+    
+    # 备注
+    remarks = Column(Text)
+    
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'id': self.id,
+            'code': self.code,
+            'name': self.name,
+            'market': self.market,
+            'order_key': self.order_key,
+            'remarks': self.remarks,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class AnalysisHistory(Base):
     """
     分析结果历史记录模型
@@ -239,6 +283,116 @@ class AnalysisHistory(Base):
         }
 
 
+class PortfolioHoldingCurrent(Base):
+    """
+    用户当前持仓数据（按 owner_key 隔离）。
+    """
+    __tablename__ = 'portfolio_holding_current'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_key = Column(String(128), nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50), nullable=False)
+    market = Column(String(10), nullable=False, index=True)  # CN/HK/US
+    avg_cost = Column(Float, nullable=False)
+    shares = Column(Float, nullable=True)      # 持仓股数（可选，支持小数）
+    weight_pct = Column(Float, nullable=False)  # 占总资产比例 [0, 100]
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('owner_key', 'code', name='uix_owner_code'),
+        Index('ix_owner_market_order', 'owner_key', 'market', 'updated_at'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "owner_key": self.owner_key,
+            "code": self.code,
+            "name": self.name,
+            "market": self.market,
+            "avg_cost": self.avg_cost,
+            "shares": self.shares,
+            "weight_pct": self.weight_pct,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PortfolioHoldingHistory(Base):
+    """
+    用户持仓变更快照历史。
+    """
+    __tablename__ = 'portfolio_holding_history'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_key = Column(String(128), nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    market = Column(String(10), nullable=False, index=True)
+    action = Column(String(16), nullable=False, index=True)  # add/update/remove
+    old_avg_cost = Column(Float)
+    new_avg_cost = Column(Float)
+    old_shares = Column(Float)
+    new_shares = Column(Float)
+    old_weight_pct = Column(Float)
+    new_weight_pct = Column(Float)
+    trade_price = Column(Float)    # 本次成交价格（买/卖）
+    trade_shares = Column(Float)   # 本次成交股数
+    realized_pnl = Column(Float)   # 本次已实现盈亏（卖出时）
+    operator = Column(String(128))
+    changed_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_holding_history_owner_time', 'owner_key', 'changed_at'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "owner_key": self.owner_key,
+            "code": self.code,
+            "name": self.name,
+            "market": self.market,
+            "action": self.action,
+            "old_avg_cost": self.old_avg_cost,
+            "new_avg_cost": self.new_avg_cost,
+            "old_shares": self.old_shares,
+            "new_shares": self.new_shares,
+            "old_weight_pct": self.old_weight_pct,
+            "new_weight_pct": self.new_weight_pct,
+            "trade_price": self.trade_price,
+            "trade_shares": self.trade_shares,
+            "realized_pnl": self.realized_pnl,
+            "operator": self.operator,
+            "changed_at": self.changed_at.isoformat() if self.changed_at else None,
+        }
+
+
+class PortfolioUserConfig(Base):
+    """
+    用户组合配置（总资产、汇率参数）。
+    """
+    __tablename__ = 'portfolio_user_config'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_key = Column(String(128), nullable=False, unique=True, index=True)
+    total_asset_cny = Column(Float, nullable=True)     # 组合总资产（人民币）
+    usd_cny = Column(Float, nullable=False, default=6.94)
+    hkd_cny = Column(Float, nullable=False, default=0.888)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "owner_key": self.owner_key,
+            "total_asset_cny": self.total_asset_cny,
+            "usd_cny": self.usd_cny,
+            "hkd_cny": self.hkd_cny,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class DatabaseManager:
     """
     数据库管理器 - 单例模式
@@ -288,12 +442,49 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._ensure_portfolio_schema()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
 
         # 注册退出钩子，确保程序退出时关闭数据库连接
         atexit.register(DatabaseManager._cleanup_engine, self._engine)
+        self._name_fetcher_manager = None
+        self._name_cache_lock = threading.Lock()
+        self._ak_name_cache: Dict[str, Dict[str, str]] = {"CN": {}, "HK": {}, "US": {}}
+
+    def _ensure_portfolio_schema(self) -> None:
+        """
+        对已存在库做轻量列迁移（SQLite 兼容）。
+        """
+        try:
+            with self._engine.begin() as conn:
+                existing_cols = {}
+                for table_name in ["portfolio_holding_current", "portfolio_holding_history"]:
+                    rows = conn.execute(text(f"PRAGMA table_info({table_name})")).mappings().all()
+                    existing_cols[table_name] = {r.get("name") for r in rows}
+
+                current_additions = {
+                    "shares": "ALTER TABLE portfolio_holding_current ADD COLUMN shares FLOAT",
+                }
+                for col, ddl in current_additions.items():
+                    if col not in existing_cols.get("portfolio_holding_current", set()):
+                        conn.execute(text(ddl))
+                        logger.info(f"数据库迁移: portfolio_holding_current 新增列 {col}")
+
+                history_additions = {
+                    "old_shares": "ALTER TABLE portfolio_holding_history ADD COLUMN old_shares FLOAT",
+                    "new_shares": "ALTER TABLE portfolio_holding_history ADD COLUMN new_shares FLOAT",
+                    "trade_price": "ALTER TABLE portfolio_holding_history ADD COLUMN trade_price FLOAT",
+                    "trade_shares": "ALTER TABLE portfolio_holding_history ADD COLUMN trade_shares FLOAT",
+                    "realized_pnl": "ALTER TABLE portfolio_holding_history ADD COLUMN realized_pnl FLOAT",
+                }
+                for col, ddl in history_additions.items():
+                    if col not in existing_cols.get("portfolio_holding_history", set()):
+                        conn.execute(text(ddl))
+                        logger.info(f"数据库迁移: portfolio_holding_history 新增列 {col}")
+        except Exception as e:
+            logger.warning(f"数据库轻量迁移失败（可忽略新功能）: {e}")
     
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
@@ -635,6 +826,943 @@ class DatabaseManager:
             ).scalars().all()
             
             return list(results)
+    
+    # ==================== Watchlist 操作 ====================
+
+    @staticmethod
+    def _normalize_watchlist_code(code: str, market: str) -> str:
+        """规范化自选股代码格式。"""
+        code = (code or "").strip().upper()
+        market = (market or "CN").strip().upper()
+
+        if market == "HK":
+            if re.match(r'^\d{5}$', code):
+                return f"HK{code}"
+            if re.match(r'^HK\d{5}$', code):
+                return code
+        return code
+
+    def _resolve_watchlist_name(self, code: str, market: str) -> Optional[str]:
+        """
+        通过数据源反查股票名称。
+        失败时返回 None。
+        """
+        query_candidates = [code]
+        if market == "HK" and code.startswith("HK") and len(code) == 7:
+            query_candidates.append(code[2:])  # 某些数据源使用 5 位港股代码
+
+        # 1) 静态映射兜底（快速且稳定）
+        try:
+            from src.analyzer import STOCK_NAME_MAP
+            for q in query_candidates:
+                if q in STOCK_NAME_MAP:
+                    return STOCK_NAME_MAP[q]
+        except Exception:
+            pass
+
+        # 2) AkShare 全市场列表兜底（覆盖大量 A股/ETF/港股）
+        ak_name = self._resolve_name_from_akshare_cache(code, market)
+        if ak_name:
+            return ak_name
+
+        # 3) 搜索服务兜底（可复用内置/历史/在线候选池）
+        search_name = self._resolve_name_from_search_service(code, market)
+        if search_name:
+            return search_name
+
+        # 4) 美股实时行情兜底（US 优先走 yfinance，返回公司简称）
+        realtime_name = self._resolve_name_from_realtime_quote(code, market)
+        if realtime_name:
+            return realtime_name
+
+        # 5) AI 识别兜底（最后手段，可能有误差）
+        ai_name = self._resolve_name_with_ai(code, market)
+        if ai_name:
+            return ai_name
+
+        return None
+
+    def _resolve_name_from_search_service(self, code: str, market: str) -> Optional[str]:
+        try:
+            from web.services import get_stock_search_service
+            service = get_stock_search_service()
+            resp = service.search(keyword=code, market=market, limit=5)
+            rows = resp.get("data", []) if isinstance(resp, dict) else []
+            code_upper = (code or "").strip().upper()
+            for row in rows:
+                row_code = str(row.get("code", "")).strip().upper()
+                row_name = str(row.get("name", "")).strip()
+                if not row_code or not row_name:
+                    continue
+                if row_code == code_upper and row_name.upper() != code_upper:
+                    return row_name
+            if rows:
+                first = rows[0]
+                first_name = str(first.get("name", "")).strip()
+                first_code = str(first.get("code", "")).strip().upper()
+                if first_name and first_name.upper() != first_code:
+                    return first_name
+        except Exception as e:
+            logger.debug(f"search_service 兜底查名失败 code={code}, market={market}: {e}")
+        return None
+
+    def _resolve_name_from_realtime_quote(self, code: str, market: str) -> Optional[str]:
+        if (market or "").upper() != "US":
+            return None
+        try:
+            from data_provider import DataFetcherManager
+            manager = DataFetcherManager()
+            quote = manager.get_realtime_quote(code)
+            if quote and getattr(quote, "name", None):
+                name = str(quote.name).strip()
+                if name and name.upper() != code.upper():
+                    return name
+        except Exception as e:
+            logger.debug(f"realtime_quote 兜底查名失败 code={code}: {e}")
+        return None
+
+    def _resolve_name_with_ai(self, code: str, market: str) -> Optional[str]:
+        """
+        AI 兜底识别股票名称。
+        注意：仅作为最后手段，要求返回简短名称；返回 UNKNOWN 则视为失败。
+        """
+        try:
+            from src.config import get_config
+            cfg = get_config()
+            if not (cfg.gemini_api_key or cfg.openai_api_key):
+                return None
+            from src.analyzer import GeminiAnalyzer
+            analyzer = GeminiAnalyzer()
+            if not analyzer.is_available():
+                return None
+
+            prompt = (
+                "你是股票代码识别器。请根据股票代码返回该股票常用中文名或英文公司简称。"
+                "如果无法确定，返回 UNKNOWN。只输出名称，不要解释。\n"
+                f"市场: {market}\n代码: {code}"
+            )
+            out = analyzer._call_api_with_retry(
+                prompt,
+                generation_config={"temperature": 0.0, "max_output_tokens": 64}
+            )
+            name = (out or "").strip().replace("`", "").replace('"', "")
+            if not name:
+                return None
+            bad = {"UNKNOWN", "N/A", "NONE", "无法确定", "不确定"}
+            if name.upper() in bad:
+                return None
+            if len(name) > 40:
+                name = name[:40].strip()
+            if name.upper() == code.upper():
+                return None
+            return name
+        except Exception as e:
+            logger.debug(f"AI 兜底查名失败 code={code}, market={market}: {e}")
+            return None
+
+    def _resolve_name_from_akshare_cache(self, code: str, market: str) -> Optional[str]:
+        """
+        从 akshare 全市场列表缓存中反查名称。
+        注意：首次调用会拉全量列表，后续命中本地缓存。
+        """
+        market = (market or "CN").upper()
+        with self._name_cache_lock:
+            cache = self._ak_name_cache.setdefault(market, {})
+            if cache:
+                return cache.get(code)
+
+            try:
+                import akshare as ak
+            except Exception as e:
+                logger.debug(f"akshare 导入失败，无法兜底查名: {e}")
+                return None
+
+            try:
+                if market == "CN":
+                    # 包含大量 A股/ETF 标的
+                    df = ak.stock_zh_a_spot_em()
+                    if df is not None and not df.empty and '代码' in df.columns and '名称' in df.columns:
+                        for _, row in df.iterrows():
+                            c = str(row.get('代码', '')).strip().upper()
+                            n = str(row.get('名称', '')).strip()
+                            if c and n:
+                                cache[c] = n
+                elif market == "HK":
+                    df = ak.stock_hk_spot_em()
+                    if df is not None and not df.empty and '代码' in df.columns and '名称' in df.columns:
+                        for _, row in df.iterrows():
+                            c5 = str(row.get('代码', '')).strip().zfill(5)
+                            n = str(row.get('名称', '')).strip()
+                            if c5 and n:
+                                cache[f"HK{c5}"] = n
+                else:
+                    if hasattr(ak, "stock_us_spot_em"):
+                        df = ak.stock_us_spot_em()
+                        if df is not None and not df.empty and '代码' in df.columns and '名称' in df.columns:
+                            for _, row in df.iterrows():
+                                c = str(row.get('代码', '')).strip().upper()
+                                n = str(row.get('名称', '')).strip()
+                                if c and n:
+                                    cache[c] = n
+            except Exception as e:
+                logger.debug(f"akshare 全市场查名失败 market={market}: {e}")
+                return None
+
+            return cache.get(code)
+
+    def backfill_watchlist_names(self, limit: int = 200) -> int:
+        """
+        对数据库中“名称缺失或等于代码”的自选股执行名称补全并落库。
+
+        Returns:
+            本次成功补全数量
+        """
+        updated_count = 0
+        with self.get_session() as session:
+            try:
+                rows = session.execute(
+                    select(Watchlist).order_by(Watchlist.order_key).limit(limit)
+                ).scalars().all()
+
+                for row in rows:
+                    code = (row.code or "").strip().upper()
+                    market = (row.market or "CN").strip().upper()
+                    name = (row.name or "").strip()
+
+                    if not code:
+                        continue
+                    if name and name.upper() != code:
+                        continue
+
+                    resolved = self._resolve_watchlist_name(code, market)
+                    if resolved and resolved.upper() != code:
+                        row.name = resolved
+                        updated_count += 1
+
+                if updated_count > 0:
+                    session.commit()
+                    logger.info(f"自选股名称补全完成，更新 {updated_count} 条")
+                else:
+                    session.rollback()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"自选股名称补全失败: {e}")
+
+        return updated_count
+    
+    def add_watchlist(
+        self,
+        code: str,
+        name: Optional[str] = None,
+        market: str = "CN",
+        verified: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """
+        添加自选股
+        
+        Args:
+            code: 股票代码
+            name: 股票名称（可选）
+            market: 市场类型（CN/HK/US）
+            verified: 名称是否已在上游完成验证（如名称搜索命中）
+            
+        Returns:
+            Watchlist 字典，或 None（如果已存在）
+        """
+        market = (market or "CN").strip().upper()
+        code = self._normalize_watchlist_code(code, market)
+        input_name = (name or "").strip()
+        if input_name and input_name.upper() == code:
+            input_name = ""
+        
+        # 严格模式：必须能确认“代码 -> 名称”映射，才能入库
+        resolved_from_source = self._resolve_watchlist_name(code, market)
+        if resolved_from_source and resolved_from_source.upper() == code:
+            resolved_from_source = None
+
+        if verified and input_name:
+            # 调用方已完成名称匹配验证（例如通过名称搜索命中）
+            resolved_name = input_name
+        else:
+            resolved_name = resolved_from_source
+
+        if not resolved_name:
+            logger.warning(f"添加自选股失败：无法确认股票名称 code={code}, market={market}")
+            return None
+
+        with self.get_session() as session:
+            try:
+                # 检查是否已存在
+                existing = session.execute(
+                    select(Watchlist).where(Watchlist.code == code)
+                ).scalar_one_or_none()
+                
+                if existing:
+                    return None
+                
+                # 获取最大的 order_key
+                max_order = session.execute(
+                    select(Watchlist).order_by(desc(Watchlist.order_key)).limit(1)
+                ).scalar_one_or_none()
+                
+                next_order = (max_order.order_key + 1) if max_order else 0
+                
+                # 创建新的自选股
+                watchlist = Watchlist(
+                    code=code,
+                    name=resolved_name,
+                    market=market,
+                    order_key=next_order
+                )
+                session.add(watchlist)
+                session.commit()
+                
+                # 返回字典而不是对象
+                return watchlist.to_dict()
+            except IntegrityError:
+                session.rollback()
+                return None
+            except Exception as e:
+                session.rollback()
+                logger.error(f"添加自选股失败: {e}")
+                return None
+    
+    def remove_watchlist(self, code: str) -> bool:
+        """
+        删除自选股
+        
+        Args:
+            code: 股票代码
+            
+        Returns:
+            是否删除成功
+        """
+        with self.get_session() as session:
+            try:
+                watchlist = session.execute(
+                    select(Watchlist).where(Watchlist.code == code)
+                ).scalar_one_or_none()
+                
+                if watchlist:
+                    session.delete(watchlist)
+                    session.commit()
+                    return True
+                return False
+            except Exception as e:
+                session.rollback()
+                logger.error(f"删除自选股失败: {e}")
+                return False
+
+    def update_watchlist_name(self, code: str, name: str) -> bool:
+        """
+        更新自选股名称。
+
+        Args:
+            code: 股票代码（如 600519 / HK00700）
+            name: 股票名称
+
+        Returns:
+            是否更新成功
+        """
+        code = (code or "").strip().upper()
+        name = (name or "").strip()
+        if not code or not name:
+            return False
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(Watchlist).where(Watchlist.code == code)
+                ).scalar_one_or_none()
+
+                if row is None:
+                    return False
+
+                if row.name == name:
+                    return True
+
+                row.name = name
+                session.commit()
+                return True
+            except Exception as e:
+                session.rollback()
+                logger.error(f"更新自选股名称失败: code={code}, error={e}")
+                return False
+    
+    def get_watchlist(self, market: Optional[str] = None) -> List[Watchlist]:
+        """
+        获取自选股列表
+        
+        Args:
+            market: 市场筛选（CN/HK/US，为 None 时返回全部）
+            
+        Returns:
+            Watchlist 对象列表
+        """
+        with self.get_session() as session:
+            query = select(Watchlist)
+            
+            if market:
+                query = query.where(Watchlist.market == market)
+            
+            results = session.execute(
+                query.order_by(Watchlist.order_key, Watchlist.created_at)
+            ).scalars().all()
+            
+            return list(results)
+    
+    def get_watchlist_grouped(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        按市场分组获取自选股列表
+        
+        Returns:
+            {'CN': [...], 'HK': [...], 'US': [...]}
+        """
+        watchlist = self.get_watchlist()
+        grouped: Dict[str, List[Dict[str, Any]]] = {'CN': [], 'HK': [], 'US': []}
+        
+        for item in watchlist:
+            market = item.market or 'CN'
+            if market not in grouped:
+                grouped[market] = []
+            # 如果已经是字典，直接使用；否则调用 to_dict()
+            if isinstance(item, dict):
+                grouped[market].append(item)
+            else:
+                grouped[market].append(item.to_dict())
+        
+        return grouped
+
+    # ==================== Portfolio Holding 操作 ====================
+
+    @staticmethod
+    def _validate_holding_values(avg_cost: float, weight_pct: float) -> Optional[str]:
+        if avg_cost is None:
+            return "持仓成本不能为空"
+        if weight_pct is None or weight_pct <= 0 or weight_pct > 100:
+            return "持仓比例必须在 (0, 100] 范围内"
+        return None
+
+    def save_holding_history(
+        self,
+        owner_key: str,
+        code: str,
+        name: str,
+        market: str,
+        action: str,
+        old_avg_cost: Optional[float],
+        new_avg_cost: Optional[float],
+        old_shares: Optional[float],
+        new_shares: Optional[float],
+        old_weight_pct: Optional[float],
+        new_weight_pct: Optional[float],
+        trade_price: Optional[float] = None,
+        trade_shares: Optional[float] = None,
+        realized_pnl: Optional[float] = None,
+        operator: Optional[str] = None,
+    ) -> bool:
+        """
+        保存持仓变更历史快照。
+        """
+        with self.get_session() as session:
+            try:
+                record = PortfolioHoldingHistory(
+                    owner_key=owner_key,
+                    code=code,
+                    name=name,
+                    market=market,
+                    action=action,
+                    old_avg_cost=old_avg_cost,
+                    new_avg_cost=new_avg_cost,
+                    old_shares=old_shares,
+                    new_shares=new_shares,
+                    old_weight_pct=old_weight_pct,
+                    new_weight_pct=new_weight_pct,
+                    trade_price=trade_price,
+                    trade_shares=trade_shares,
+                    realized_pnl=realized_pnl,
+                    operator=operator or owner_key,
+                    changed_at=datetime.now(),
+                )
+                session.add(record)
+                session.commit()
+                return True
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存持仓历史失败: owner={owner_key}, code={code}, error={e}")
+                return False
+
+    def upsert_holding(
+        self,
+        owner_key: str,
+        code: str,
+        name: Optional[str],
+        market: str,
+        avg_cost: float,
+        shares: Optional[float],
+        weight_pct: float,
+        operator: Optional[str] = None,
+        verified: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        新增或更新用户持仓（写入 current，并记录 history）。
+        """
+        owner_key = (owner_key or "").strip().lower()
+        if not owner_key:
+            return {"success": False, "error": "owner_key 不能为空"}
+
+        market = (market or "CN").strip().upper()
+        code = self._normalize_watchlist_code(code, market)
+        err = self._validate_holding_values(avg_cost, weight_pct)
+        if err:
+            return {"success": False, "error": err}
+
+        resolved_name = (name or "").strip()
+        if not resolved_name or resolved_name.upper() == code:
+            resolved_name = self._resolve_watchlist_name(code, market) or ""
+        if verified and name and name.strip():
+            resolved_name = name.strip()
+        if not resolved_name or resolved_name.upper() == code:
+            return {"success": False, "error": f"无法确认股票名称: {code}"}
+
+        with self.get_session() as session:
+            try:
+                existing = session.execute(
+                    select(PortfolioHoldingCurrent).where(
+                        and_(
+                            PortfolioHoldingCurrent.owner_key == owner_key,
+                            PortfolioHoldingCurrent.code == code
+                        )
+                    )
+                ).scalar_one_or_none()
+
+                action = "add"
+                old_avg_cost = None
+                old_weight = None
+                old_shares = None
+                if existing:
+                    action = "update"
+                    old_avg_cost = existing.avg_cost
+                    old_weight = existing.weight_pct
+                    old_shares = existing.shares
+                    existing.name = resolved_name
+                    existing.market = market
+                    existing.avg_cost = float(avg_cost)
+                    existing.shares = float(shares) if shares is not None else existing.shares
+                    existing.weight_pct = float(weight_pct)
+                    existing.updated_at = datetime.now()
+                    row = existing
+                else:
+                    row = PortfolioHoldingCurrent(
+                        owner_key=owner_key,
+                        code=code,
+                        name=resolved_name,
+                        market=market,
+                        avg_cost=float(avg_cost),
+                        shares=float(shares) if shares is not None else None,
+                        weight_pct=float(weight_pct),
+                        created_at=datetime.now(),
+                        updated_at=datetime.now(),
+                    )
+                    session.add(row)
+                    session.flush()
+
+                history = PortfolioHoldingHistory(
+                    owner_key=owner_key,
+                    code=code,
+                    name=resolved_name,
+                    market=market,
+                    action=action,
+                    old_avg_cost=old_avg_cost,
+                    new_avg_cost=float(avg_cost),
+                    old_shares=old_shares,
+                    new_shares=float(shares) if shares is not None else row.shares,
+                    old_weight_pct=old_weight,
+                    new_weight_pct=float(weight_pct),
+                    operator=operator or owner_key,
+                    changed_at=datetime.now(),
+                )
+                session.add(history)
+                session.commit()
+
+                return {"success": True, "action": action, "data": row.to_dict()}
+            except Exception as e:
+                session.rollback()
+                logger.error(f"upsert_holding 失败: owner={owner_key}, code={code}, error={e}")
+                return {"success": False, "error": str(e)}
+
+    def remove_holding(self, owner_key: str, code: str, operator: Optional[str] = None) -> Dict[str, Any]:
+        """
+        删除用户持仓，并写入历史快照。
+        """
+        owner_key = (owner_key or "").strip().lower()
+        code = (code or "").strip().upper()
+        if not owner_key or not code:
+            return {"success": False, "error": "owner_key/code 不能为空"}
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(PortfolioHoldingCurrent).where(
+                        and_(
+                            PortfolioHoldingCurrent.owner_key == owner_key,
+                            PortfolioHoldingCurrent.code == code
+                        )
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    return {"success": False, "error": "持仓不存在"}
+
+                data = row.to_dict()
+                session.delete(row)
+                session.flush()
+
+                history = PortfolioHoldingHistory(
+                    owner_key=owner_key,
+                    code=data["code"],
+                    name=data.get("name"),
+                    market=data["market"],
+                    action="remove",
+                    old_avg_cost=data.get("avg_cost"),
+                    new_avg_cost=None,
+                    old_shares=data.get("shares"),
+                    new_shares=None,
+                    old_weight_pct=data.get("weight_pct"),
+                    new_weight_pct=None,
+                    operator=operator or owner_key,
+                    changed_at=datetime.now(),
+                )
+                session.add(history)
+                session.commit()
+                return {"success": True, "data": data}
+            except Exception as e:
+                session.rollback()
+                logger.error(f"remove_holding 失败: owner={owner_key}, code={code}, error={e}")
+                return {"success": False, "error": str(e)}
+
+    def sell_holding(
+        self,
+        owner_key: str,
+        code: str,
+        sell_price: float,
+        sell_shares: float,
+        operator: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        卖出持仓：自动扣减股数，按比例更新仓位；部分卖出不改变持仓成本。
+        """
+        owner_key = (owner_key or "").strip().lower()
+        code = (code or "").strip().upper()
+        if not owner_key or not code:
+            return {"success": False, "error": "owner_key/code 不能为空"}
+        if sell_price is None or sell_price <= 0:
+            return {"success": False, "error": "卖出价格必须大于 0"}
+        if sell_shares is None or sell_shares <= 0:
+            return {"success": False, "error": "卖出股数必须大于 0"}
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(PortfolioHoldingCurrent).where(
+                        and_(
+                            PortfolioHoldingCurrent.owner_key == owner_key,
+                            PortfolioHoldingCurrent.code == code
+                        )
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    return {"success": False, "error": "持仓不存在"}
+
+                old_shares = float(row.shares or 0.0)
+                if old_shares <= 0:
+                    return {"success": False, "error": "当前持仓未记录股数，请先用 /position set 补充股数后再卖出"}
+                if sell_shares - old_shares > 1e-8:
+                    return {"success": False, "error": f"卖出股数超过持仓股数（持仓: {old_shares:g}）"}
+
+                old_avg_cost = float(row.avg_cost or 0.0)
+                old_weight = float(row.weight_pct or 0.0)
+                remain_shares = old_shares - float(sell_shares)
+                realized_pnl = (float(sell_price) - old_avg_cost) * float(sell_shares)
+
+                if remain_shares <= 1e-8:
+                    data = row.to_dict()
+                    session.delete(row)
+                    session.flush()
+                    history = PortfolioHoldingHistory(
+                        owner_key=owner_key,
+                        code=data["code"],
+                        name=data.get("name"),
+                        market=data["market"],
+                        action="sell_all",
+                        old_avg_cost=old_avg_cost,
+                        new_avg_cost=None,
+                        old_shares=old_shares,
+                        new_shares=0.0,
+                        old_weight_pct=old_weight,
+                        new_weight_pct=0.0,
+                        trade_price=float(sell_price),
+                        trade_shares=float(sell_shares),
+                        realized_pnl=float(realized_pnl),
+                        operator=operator or owner_key,
+                        changed_at=datetime.now(),
+                    )
+                    session.add(history)
+                    session.commit()
+                    return {
+                        "success": True,
+                        "action": "sell_all",
+                        "data": data,
+                        "realized_pnl": float(realized_pnl),
+                        "remain_shares": 0.0,
+                        "remain_weight_pct": 0.0,
+                        "avg_cost": old_avg_cost,
+                    }
+
+                remain_ratio = remain_shares / old_shares
+                new_weight = max(0.0, old_weight * remain_ratio)
+
+                row.shares = float(remain_shares)
+                row.weight_pct = float(new_weight)
+                row.updated_at = datetime.now()
+
+                history = PortfolioHoldingHistory(
+                    owner_key=owner_key,
+                    code=row.code,
+                    name=row.name,
+                    market=row.market,
+                    action="sell",
+                    old_avg_cost=old_avg_cost,
+                    new_avg_cost=old_avg_cost,
+                    old_shares=old_shares,
+                    new_shares=float(remain_shares),
+                    old_weight_pct=old_weight,
+                    new_weight_pct=float(new_weight),
+                    trade_price=float(sell_price),
+                    trade_shares=float(sell_shares),
+                    realized_pnl=float(realized_pnl),
+                    operator=operator or owner_key,
+                    changed_at=datetime.now(),
+                )
+                session.add(history)
+                session.commit()
+                return {
+                    "success": True,
+                    "action": "sell",
+                    "data": row.to_dict(),
+                    "realized_pnl": float(realized_pnl),
+                    "remain_shares": float(remain_shares),
+                    "remain_weight_pct": float(new_weight),
+                    "avg_cost": old_avg_cost,
+                }
+            except Exception as e:
+                session.rollback()
+                logger.error(f"sell_holding 失败: owner={owner_key}, code={code}, error={e}")
+                return {"success": False, "error": str(e)}
+
+    def list_holdings(self, owner_key: str, market: Optional[str] = None) -> List[PortfolioHoldingCurrent]:
+        """
+        列出用户当前持仓。
+        """
+        owner_key = (owner_key or "").strip().lower()
+        if not owner_key:
+            return []
+
+        with self.get_session() as session:
+            query = select(PortfolioHoldingCurrent).where(PortfolioHoldingCurrent.owner_key == owner_key)
+            if market:
+                query = query.where(PortfolioHoldingCurrent.market == market.upper())
+            rows = session.execute(
+                query.order_by(desc(PortfolioHoldingCurrent.weight_pct), PortfolioHoldingCurrent.code)
+            ).scalars().all()
+            return list(rows)
+
+    def get_holding(self, owner_key: str, code: str) -> Optional[PortfolioHoldingCurrent]:
+        """
+        获取用户单只持仓。
+        """
+        owner_key = (owner_key or "").strip().lower()
+        code = (code or "").strip().upper()
+        if not owner_key or not code:
+            return None
+
+        with self.get_session() as session:
+            return session.execute(
+                select(PortfolioHoldingCurrent).where(
+                    and_(
+                        PortfolioHoldingCurrent.owner_key == owner_key,
+                        PortfolioHoldingCurrent.code == code
+                    )
+                )
+            ).scalar_one_or_none()
+
+    def get_portfolio_profile(
+        self,
+        owner_key: str,
+        latest_prices: Optional[Dict[str, float]] = None,
+        top_n: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        生成用户组合画像：总仓位、市场分布、集中度、成本偏离等。
+        """
+        latest_prices = latest_prices or {}
+        holdings = self.list_holdings(owner_key)
+        if not holdings:
+            return {
+                "owner_key": (owner_key or "").strip().lower(),
+                "holding_count": 0,
+                "total_weight_pct": 0.0,
+                "market_distribution": {"CN": 0.0, "HK": 0.0, "US": 0.0},
+                "max_single_weight_pct": 0.0,
+                "concentration_top3_pct": 0.0,
+                "top_holdings": [],
+                "cost_deviation_stats": {"profit_count": 0, "loss_count": 0, "flat_count": 0},
+                "overall_pnl_weighted_pct": None,
+            }
+
+        total_weight = 0.0
+        by_market = {"CN": 0.0, "HK": 0.0, "US": 0.0}
+        top_holdings: List[Dict[str, Any]] = []
+        weighted_pnl_sum = 0.0
+        pnl_weight_sum = 0.0
+        profit_count = 0
+        loss_count = 0
+        flat_count = 0
+
+        for row in holdings:
+            weight = float(row.weight_pct or 0.0)
+            total_weight += weight
+            by_market[row.market] = by_market.get(row.market, 0.0) + weight
+
+            current_price = latest_prices.get(row.code)
+            pnl_pct = None
+            if current_price and row.avg_cost and row.avg_cost > 0:
+                pnl_pct = (float(current_price) - float(row.avg_cost)) / float(row.avg_cost) * 100.0
+                weighted_pnl_sum += pnl_pct * weight
+                pnl_weight_sum += weight
+                if pnl_pct > 1e-8:
+                    profit_count += 1
+                elif pnl_pct < -1e-8:
+                    loss_count += 1
+                else:
+                    flat_count += 1
+            else:
+                flat_count += 1
+
+            top_holdings.append({
+                "code": row.code,
+                "name": row.name,
+                "market": row.market,
+                "avg_cost": float(row.avg_cost),
+                "weight_pct": weight,
+                "current_price": float(current_price) if current_price is not None else None,
+                "pnl_pct": pnl_pct,
+                "weight_contribution_pct": (pnl_pct * weight / 100.0) if pnl_pct is not None else None,
+            })
+
+        top_holdings.sort(key=lambda x: (-x["weight_pct"], x["code"]))
+        top_n_rows = top_holdings[:max(1, top_n)]
+        top3_weight = sum(x["weight_pct"] for x in top_holdings[:3])
+        max_single = max((x["weight_pct"] for x in top_holdings), default=0.0)
+
+        return {
+            "owner_key": (owner_key or "").strip().lower(),
+            "holding_count": len(holdings),
+            "total_weight_pct": round(total_weight, 4),
+            "market_distribution": {k: round(v, 4) for k, v in by_market.items()},
+            "max_single_weight_pct": round(max_single, 4),
+            "concentration_top3_pct": round(top3_weight, 4),
+            "top_holdings": top_n_rows,
+            "cost_deviation_stats": {
+                "profit_count": profit_count,
+                "loss_count": loss_count,
+                "flat_count": flat_count,
+            },
+            "overall_pnl_weighted_pct": round(weighted_pnl_sum / pnl_weight_sum, 4) if pnl_weight_sum > 0 else None,
+        }
+
+    def get_portfolio_user_config(self, owner_key: str) -> Dict[str, Any]:
+        owner_key = (owner_key or "").strip().lower()
+        if not owner_key:
+            return {"owner_key": "", "total_asset_cny": None, "usd_cny": 6.94, "hkd_cny": 0.888}
+
+        with self.get_session() as session:
+            row = session.execute(
+                select(PortfolioUserConfig).where(PortfolioUserConfig.owner_key == owner_key)
+            ).scalar_one_or_none()
+            if row is None:
+                return {"owner_key": owner_key, "total_asset_cny": None, "usd_cny": 6.94, "hkd_cny": 0.888}
+            data = row.to_dict()
+            data["usd_cny"] = float(data.get("usd_cny") or 6.94)
+            data["hkd_cny"] = float(data.get("hkd_cny") or 0.888)
+            return data
+
+    def upsert_portfolio_user_config(
+        self,
+        owner_key: str,
+        total_asset_cny: Optional[float] = None,
+        usd_cny: Optional[float] = None,
+        hkd_cny: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        owner_key = (owner_key or "").strip().lower()
+        if not owner_key:
+            return {"success": False, "error": "owner_key 不能为空"}
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(PortfolioUserConfig).where(PortfolioUserConfig.owner_key == owner_key)
+                ).scalar_one_or_none()
+                if row is None:
+                    row = PortfolioUserConfig(
+                        owner_key=owner_key,
+                        total_asset_cny=float(total_asset_cny) if total_asset_cny is not None else None,
+                        usd_cny=float(usd_cny) if usd_cny is not None else 6.94,
+                        hkd_cny=float(hkd_cny) if hkd_cny is not None else 0.888,
+                        updated_at=datetime.now(),
+                    )
+                    session.add(row)
+                else:
+                    if total_asset_cny is not None:
+                        row.total_asset_cny = float(total_asset_cny)
+                    if usd_cny is not None:
+                        row.usd_cny = float(usd_cny)
+                    if hkd_cny is not None:
+                        row.hkd_cny = float(hkd_cny)
+                    row.updated_at = datetime.now()
+
+                session.commit()
+                return {"success": True, "data": row.to_dict()}
+            except Exception as e:
+                session.rollback()
+                logger.error(f"upsert_portfolio_user_config 失败: owner={owner_key}, error={e}")
+                return {"success": False, "error": str(e)}
+    
+    def update_watchlist_order(self, codes: List[str]) -> bool:
+        """
+        批量更新自选股排序
+        
+        Args:
+            codes: 按顺序的股票代码列表
+            
+        Returns:
+            是否更新成功
+        """
+        with self.get_session() as session:
+            try:
+                for idx, code in enumerate(codes):
+                    watchlist = session.execute(
+                        select(Watchlist).where(Watchlist.code == code)
+                    ).scalar_one_or_none()
+                    
+                    if watchlist:
+                        watchlist.order_key = idx
+                
+                session.commit()
+                return True
+            except Exception as e:
+                session.rollback()
+                logger.error(f"更新自选股排序失败: {e}")
+                return False
     
     def save_daily_data(
         self, 

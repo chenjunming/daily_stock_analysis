@@ -23,8 +23,14 @@ from http import HTTPStatus
 from datetime import datetime
 from typing import Dict, Any, Optional, TYPE_CHECKING
 
-from web.services import get_config_service, get_analysis_service
+from web.services import (
+    get_config_service,
+    get_analysis_service,
+    get_watchlist_service,
+    get_stock_search_service,
+)
 from web.templates import render_config_page
+from web.new_templates import render_new_main_page
 from src.enums import ReportType
 
 if TYPE_CHECKING:
@@ -102,9 +108,7 @@ class PageHandler:
     
     def handle_index(self) -> Response:
         """处理首页请求 GET /"""
-        stock_list = self.config_service.get_stock_list()
-        env_filename = self.config_service.get_env_filename()
-        body = render_config_page(stock_list, env_filename)
+        body = render_new_main_page()
         return HtmlResponse(body)
     
     def handle_update(self, form_data: Dict[str, list]) -> Response:
@@ -130,6 +134,8 @@ class ApiHandler:
     
     def __init__(self):
         self.analysis_service = get_analysis_service()
+        self.watchlist_service = get_watchlist_service()
+        self.stock_search_service = get_stock_search_service()
     
     def handle_health(self) -> Response:
         """
@@ -172,15 +178,8 @@ class ApiHandler:
                 status=HTTPStatus.BAD_REQUEST
             )
         
-        code = code_list[0].strip()
-
-        # 验证股票代码格式：A股(6位数字) / 港股(HK+5位数字) / 美股(1-5个大写字母+.+2个后缀字母)
-        code = code.upper()
-        is_a_stock = re.match(r'^\d{6}$', code)
-        is_hk_stock = re.match(r'^HK\d{5}$', code)
-        is_us_stock = re.match(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$', code.upper())
-
-        if not (is_a_stock or is_hk_stock or is_us_stock):
+        code = code_list[0].strip().upper()
+        if not self._is_valid_stock_code(code):
             return JsonResponse(
                 {"success": False, "error": f"无效的股票代码格式: {code} (A股6位数字 / 港股HK+5位数字 / 美股1-5个字母)"},
                 status=HTTPStatus.BAD_REQUEST
@@ -209,6 +208,79 @@ class ApiHandler:
                 {"success": False, "error": f"提交任务失败: {str(e)}"},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+
+    def handle_batch_analysis(self, query: Dict[str, list]) -> Response:
+        """
+        批量触发股票分析 GET /analysis/batch?codes=600519,HK00700,AAPL
+        """
+        codes_raw = (query.get("codes", [""])[0] or "").strip()
+        if not codes_raw:
+            return JsonResponse(
+                {"success": False, "error": "缺少必填参数: codes (逗号分隔的股票代码列表)"},
+                status=HTTPStatus.BAD_REQUEST
+            )
+
+        # 去重并保序
+        normalized_codes = []
+        seen = set()
+        invalid_codes = []
+        for raw in codes_raw.split(","):
+            code = raw.strip().upper()
+            if not code:
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            if self._is_valid_stock_code(code):
+                normalized_codes.append(code)
+            else:
+                invalid_codes.append(code)
+
+        if not normalized_codes:
+            return JsonResponse(
+                {
+                    "success": False,
+                    "error": "没有可分析的有效股票代码",
+                    "invalid_codes": invalid_codes,
+                },
+                status=HTTPStatus.BAD_REQUEST
+            )
+
+        report_type_str = query.get("report_type", ["simple"])[0]
+        report_type = ReportType.from_str(report_type_str)
+
+        save_snapshot = None
+        if "save_context_snapshot" in query:
+            save_snapshot = self._parse_bool(query.get("save_context_snapshot", [""])[0])
+
+        tasks = []
+        failed = []
+        for code in normalized_codes:
+            try:
+                result = self.analysis_service.submit_analysis(
+                    code,
+                    report_type=report_type,
+                    save_context_snapshot=save_snapshot
+                )
+                tasks.append({
+                    "code": code,
+                    "task_id": result.get("task_id"),
+                    "report_type": report_type.value,
+                })
+            except Exception as e:
+                failed.append({"code": code, "error": str(e)})
+                logger.error(f"[ApiHandler] 批量提交任务失败: code={code}, error={e}")
+
+        return JsonResponse({
+            "success": len(tasks) > 0,
+            "message": f"已提交 {len(tasks)} 只股票分析任务",
+            "submitted_count": len(tasks),
+            "failed_count": len(failed),
+            "invalid_count": len(invalid_codes),
+            "tasks": tasks,
+            "failed": failed,
+            "invalid_codes": invalid_codes,
+        })
 
     def handle_analysis_history(self, query: Dict[str, list]) -> Response:
         """
@@ -254,6 +326,14 @@ class ApiHandler:
         if text in {"0", "false", "no", "n", "off"}:
             return False
         return None
+
+    @staticmethod
+    def _is_valid_stock_code(code: str) -> bool:
+        """验证股票代码格式：A股/港股/美股"""
+        is_a_stock = re.match(r'^\d{6}$', code)
+        is_hk_stock = re.match(r'^HK\d{5}$', code)
+        is_us_stock = re.match(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$', code)
+        return bool(is_a_stock or is_hk_stock or is_us_stock)
     
     def handle_tasks(self, query: Dict[str, list]) -> Response:
         """
@@ -301,6 +381,84 @@ class ApiHandler:
             )
         
         return JsonResponse({"success": True, "task": task})
+    
+    # ==================== Watchlist 处理器 ====================
+    
+    def handle_watchlist_add(self, query: Dict[str, list]) -> Response:
+        """添加自选股 GET /watchlist/add?code=xxx&name=xxx&market=CN"""
+        code = (query.get("code", [""])[0] or "").strip().upper()
+        name = (query.get("name", [""])[0] or "").strip()
+        market = (query.get("market", ["CN"])[0] or "CN").upper()
+        
+        if not code:
+            return JsonResponse(
+                {"success": False, "error": "缺少必填参数: code"},
+                status=HTTPStatus.BAD_REQUEST
+            )
+        
+        result = self.watchlist_service.add_stock(code, name or None, market)
+        status = HTTPStatus.OK if result.get("success") else HTTPStatus.BAD_REQUEST
+        return JsonResponse(result, status=status)
+    
+    def handle_watchlist_remove(self, query: Dict[str, list]) -> Response:
+        """删除自选股 GET /watchlist/remove?code=xxx"""
+        code = (query.get("code", [""])[0] or "").strip().upper()
+        
+        if not code:
+            return JsonResponse(
+                {"success": False, "error": "缺少必填参数: code"},
+                status=HTTPStatus.BAD_REQUEST
+            )
+        
+        result = self.watchlist_service.remove_stock(code)
+        return JsonResponse(result)
+    
+    def handle_watchlist_list(self, query: Dict[str, list]) -> Response:
+        """获取自选股列表 GET /watchlist/list?market=CN"""
+        market = (query.get("market", [None])[0] or "").strip() or None
+        
+        if market:
+            result = self.watchlist_service.get_watchlist(market=market)
+        else:
+            result = self.watchlist_service.get_watchlist_grouped()
+        
+        return JsonResponse(result)
+    
+    def handle_stock_analysis(self, query: Dict[str, list]) -> Response:
+        """获取股票分析历史 GET /stock/analysis?code=xxx"""
+        code = (query.get("code", [""])[0] or "").strip().upper()
+        
+        if not code:
+            return JsonResponse(
+                {"success": False, "error": "缺少必填参数: code"},
+                status=HTTPStatus.BAD_REQUEST
+            )
+        
+        limit_list = query.get("limit", ["10"])
+        try:
+            limit = int(limit_list[0])
+        except ValueError:
+            limit = 10
+        
+        result = self.watchlist_service.get_stock_analysis(code, limit)
+        return JsonResponse(result)
+
+    def handle_watchlist_search(self, query: Dict[str, list]) -> Response:
+        """股票模糊搜索 GET /watchlist/search?q=茅台&market=CN&limit=20"""
+        keyword = (query.get("q", [""])[0] or "").strip()
+        market = (query.get("market", [""])[0] or "").strip().upper() or None
+        limit_raw = (query.get("limit", ["20"])[0] or "20").strip()
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            limit = 20
+
+        if not keyword:
+            return JsonResponse({"success": True, "data": []})
+
+        result = self.stock_search_service.search(keyword=keyword, market=market, limit=limit)
+        return JsonResponse(result)
+
 
 
 # ============================================================

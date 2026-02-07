@@ -13,6 +13,10 @@ from bot.commands.status import StatusCommand
 from bot.commands.analyze import AnalyzeCommand
 from bot.commands.market import MarketCommand
 from bot.commands.batch import BatchCommand
+from bot.commands.history import HistoryCommand
+from bot.commands.watchlist import WatchlistCommand
+from bot.commands.position import PositionCommand
+from bot.commands.reanalyze import ReanalyzeCommand
 
 # 所有可用命令（用于自动注册）
 ALL_COMMANDS = [
@@ -21,6 +25,10 @@ ALL_COMMANDS = [
     AnalyzeCommand,
     MarketCommand,
     BatchCommand,
+    HistoryCommand,
+    ReanalyzeCommand,
+    WatchlistCommand,
+    PositionCommand,
 ]
 
 __all__ = [
@@ -30,5 +38,9 @@ __all__ = [
     'AnalyzeCommand',
     'MarketCommand',
     'BatchCommand',
+    'HistoryCommand',
+    'ReanalyzeCommand',
+    'WatchlistCommand',
+    'PositionCommand',
     'ALL_COMMANDS',
 ]

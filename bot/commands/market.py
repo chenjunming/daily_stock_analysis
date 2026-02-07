@@ -9,7 +9,7 @@
 
 import logging
 import threading
-from typing import List
+from typing import List, Optional
 
 from bot.commands.base import BotCommand
 from bot.models import BotMessage, BotResponse
@@ -45,16 +45,17 @@ class MarketCommand(BotCommand):
 
     @property
     def usage(self) -> str:
-        return "/market"
+        return "/market [CN|HK|US]"
 
     def execute(self, message: BotMessage, args: List[str]) -> BotResponse:
         """执行大盘复盘命令"""
         logger.info(f"[MarketCommand] 开始大盘复盘分析")
+        market_hint = self._parse_market_hint(args)
 
         # 在后台线程中执行复盘（避免阻塞）
         thread = threading.Thread(
             target=self._run_market_review,
-            args=(message,),
+            args=(message, market_hint),
             daemon=True
         )
         thread.start()
@@ -69,7 +70,33 @@ class MarketCommand(BotCommand):
             "分析完成后将自动推送结果。"
         )
 
-    def _run_market_review(self, message: BotMessage) -> None:
+    @staticmethod
+    def _parse_market_hint(args: List[str]) -> Optional[str]:
+        if not args:
+            return None
+        token = (args[0] or "").strip().upper()
+        market_map = {
+            "CN": "CN",
+            "A股": "CN",
+            "A": "CN",
+            "HK": "HK",
+            "港股": "HK",
+            "H": "HK",
+            "US": "US",
+            "美股": "US",
+            "USA": "US",
+        }
+        return market_map.get(token)
+
+    @staticmethod
+    def _build_owner_key(message: BotMessage) -> Optional[str]:
+        platform = (message.platform or "").strip().lower()
+        user_id = (message.user_id or "").strip()
+        if not platform or not user_id:
+            return None
+        return f"{platform}:{user_id}".lower()
+
+    def _run_market_review(self, message: BotMessage, market_hint: Optional[str] = None) -> None:
         """后台执行大盘复盘"""
         try:
             from src.config import get_config
@@ -101,7 +128,11 @@ class MarketCommand(BotCommand):
                 analyzer=analyzer
             )
 
-            review_report = market_analyzer.run_daily_review()
+            review_report = market_analyzer.run_daily_review(
+                query_text=(message.content or "").strip(),
+                market_hint=market_hint,
+                owner_key=self._build_owner_key(message),
+            )
 
             if review_report:
                 # 推送结果

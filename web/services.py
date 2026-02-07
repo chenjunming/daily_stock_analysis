@@ -15,13 +15,18 @@ import os
 import re
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Union
 
+import pandas as pd
+
 from src.enums import ReportType
 from src.storage import get_db
+from src.time_utils import utc8_now, utc8_today, as_utc8
 from bot.models import BotMessage
+from data_provider import DataFetcherManager
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +180,9 @@ class AnalysisService:
         code: str, 
         report_type: Union[ReportType, str] = ReportType.SIMPLE,
         source_message: Optional[BotMessage] = None,
-        save_context_snapshot: Optional[bool] = None
+        save_context_snapshot: Optional[bool] = None,
+        stream_context: Optional[Dict[str, Any]] = None,
+        force_reanalyze: bool = False,
     ) -> Dict[str, Any]:
         """
         提交异步分析任务
@@ -190,28 +197,121 @@ class AnalysisService:
         # 确保 report_type 是枚举类型
         if isinstance(report_type, str):
             report_type = ReportType.from_str(report_type)
+
+        normalized_code = self._normalize_code(code)
+
+        # 服务层防重：同股票已有运行任务时，不重复提交
+        if not force_reanalyze:
+            existing = self._find_running_task(normalized_code)
+            if existing:
+                task_id = existing.get("task_id", "")
+                logger.info(f"[AnalysisService] 命中运行中任务，跳过重复提交: code={normalized_code}, task_id={task_id}")
+                return {
+                    "success": True,
+                    "message": "已有运行中的任务，已复用",
+                    "code": normalized_code,
+                    "task_id": task_id,
+                    "report_type": report_type.value,
+                    "dedup": True,
+                    "dedup_type": "running",
+                }
+            today_hit = self._find_today_analysis_history(normalized_code)
+            if today_hit:
+                logger.info(f"[AnalysisService] 命中当日历史报告，跳过重复提交: code={normalized_code}")
+                return {
+                    "success": True,
+                    "message": "当日已有分析报告，已复用",
+                    "code": normalized_code,
+                    "task_id": "",
+                    "report_type": report_type.value,
+                    "dedup": True,
+                    "dedup_type": "history",
+                    "history_query_id": today_hit.get("query_id", ""),
+                }
         
-        task_id = f"{code}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        task_id = f"{normalized_code}_{utc8_now().strftime('%Y%m%d_%H%M%S_%f')}"
         
         # 提交到线程池
         self.executor.submit(
             self._run_analysis,
-            code,
+            normalized_code,
             task_id,
             report_type,
             source_message,
-            save_context_snapshot
+            save_context_snapshot,
+            stream_context
         )
         
-        logger.info(f"[AnalysisService] 已提交股票 {code} 的分析任务, task_id={task_id}, report_type={report_type.value}")
+        logger.info(f"[AnalysisService] 已提交股票 {normalized_code} 的分析任务, task_id={task_id}, report_type={report_type.value}")
         
         return {
             "success": True,
             "message": "分析任务已提交，将异步执行并推送通知",
-            "code": code,
+            "code": normalized_code,
             "task_id": task_id,
             "report_type": report_type.value
         }
+
+    @staticmethod
+    def _normalize_code(code: str) -> str:
+        c = (code or "").strip().upper()
+        if c.isdigit() and len(c) < 6:
+            return c.zfill(6)
+        return c
+
+    def _code_candidates(self, code: str) -> List[str]:
+        c = self._normalize_code(code)
+        out = [c]
+        if c.startswith("HK") and len(c) == 7 and c[2:].isdigit():
+            out.append(c[2:])
+        if c.isdigit():
+            out.append(c.lstrip("0") or "0")
+            if len(c) == 5:
+                out.append(f"HK{c}")
+            if len(c) <= 6:
+                out.append(c.zfill(6))
+        return list(dict.fromkeys([x for x in out if x]))
+
+    def _find_running_task(self, code: str) -> Optional[Dict[str, Any]]:
+        candidates = set(self._code_candidates(code))
+        with self._tasks_lock:
+            tasks = list(self._tasks.values())
+        for task in tasks:
+            status = str(task.get("status", "")).lower()
+            if status not in {"running", "queued"}:
+                continue
+            task_code = self._normalize_code(str(task.get("code", "")).strip().upper())
+            task_candidates = set(self._code_candidates(task_code))
+            if candidates.intersection(task_candidates):
+                return task
+        return None
+
+    def _find_today_analysis_history(self, code: str) -> Optional[Dict[str, Any]]:
+        """
+        查找 UTC+8 当天该股票的最新分析历史。
+        """
+        try:
+            db = get_db()
+            today = utc8_today()
+            latest = None
+            latest_ts = None
+            for c in self._code_candidates(code):
+                rows = db.get_analysis_history(code=c, days=2, limit=20)
+                for row in rows:
+                    created_at = getattr(row, "created_at", None)
+                    created_at_utc8 = as_utc8(created_at)
+                    if created_at_utc8 and created_at_utc8.date() == today:
+                        if latest_ts is None or created_at_utc8 > latest_ts:
+                            latest_ts = created_at_utc8
+                            latest = row
+            if latest is None:
+                return None
+            return {
+                "query_id": getattr(latest, "query_id", "") or "",
+                "code": getattr(latest, "code", "") or code,
+            }
+        except Exception:
+            return None
     
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """获取任务状态"""
@@ -246,7 +346,8 @@ class AnalysisService:
         task_id: str, 
         report_type: ReportType = ReportType.SIMPLE,
         source_message: Optional[BotMessage] = None,
-        save_context_snapshot: Optional[bool] = None
+        save_context_snapshot: Optional[bool] = None,
+        stream_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         执行单只股票分析
@@ -264,7 +365,7 @@ class AnalysisService:
                 "task_id": task_id,
                 "code": code,
                 "status": "running",
-                "start_time": datetime.now().isoformat(),
+                "start_time": utc8_now().isoformat(),
                 "result": None,
                 "error": None,
                 "report_type": report_type.value
@@ -274,18 +375,81 @@ class AnalysisService:
             # 延迟导入避免循环依赖
             from src.config import get_config
             from main import StockAnalysisPipeline
+            from bot.platforms.feishu_stream import (
+                FEISHU_SDK_AVAILABLE,
+                FeishuReplyClient,
+                FeishuCardStreamSession,
+            )
             
             logger.info(f"[AnalysisService] 开始分析股票: {code}")
-            
-            # 创建分析管道
+
             config = get_config()
+            stream_session = None
+            if (
+                stream_context
+                and stream_context.get("platform") == "feishu"
+                and getattr(config, "feishu_stream_card_enabled", True)
+                and FEISHU_SDK_AVAILABLE
+            ):
+                try:
+                    app_id = getattr(config, "feishu_app_id", None)
+                    app_secret = getattr(config, "feishu_app_secret", None)
+                    chat_id = stream_context.get("chat_id")
+                    if app_id and app_secret and chat_id:
+                        reply_client = FeishuReplyClient(app_id, app_secret)
+                        stream_session = FeishuCardStreamSession(
+                            reply_client=reply_client,
+                            chat_id=chat_id,
+                            update_interval=float(getattr(config, "feishu_stream_card_update_interval", 2.0)),
+                            max_updates=int(getattr(config, "feishu_stream_card_max_updates", 120)),
+                            at_user=False,
+                        )
+                        init_content = self._render_analyze_progress_card(
+                            code=code,
+                            report_type=report_type.value,
+                            stage="queued",
+                            detail="任务已进入队列",
+                            percent=2,
+                            task_id=task_id,
+                            started_at=utc8_now().isoformat(),
+                            version=1,
+                        )
+                        started = stream_session.start(init_content)
+                        if started:
+                            stream_context["stream_message_id"] = stream_session.message_id
+                except Exception as e:
+                    logger.warning(f"[AnalysisService] 初始化飞书流式卡片失败，回退普通模式: {e}")
+                    stream_session = None
+            
+            started_at = utc8_now().isoformat()
+
+            def progress_reporter(event: Dict[str, Any]) -> None:
+                if not stream_session:
+                    return
+                try:
+                    content = self._render_analyze_progress_card(
+                        code=code,
+                        report_type=report_type.value,
+                        stage=str(event.get("stage", "running")),
+                        detail=str(event.get("detail", "处理中")),
+                        percent=int(event.get("percent", 0)),
+                        task_id=task_id,
+                        started_at=started_at,
+                        version=stream_session.version + 1,
+                    )
+                    stream_session.update(content, force=False)
+                except Exception as e:
+                    logger.debug(f"[AnalysisService] 流式进度更新失败: {e}")
+
+            # 创建分析管道
             pipeline = StockAnalysisPipeline(
                 config=config,
                 max_workers=1,
                 source_message=source_message,
                 query_id=task_id,
                 query_source="web",
-                save_context_snapshot=save_context_snapshot
+                save_context_snapshot=save_context_snapshot,
+                progress_reporter=progress_reporter if stream_session else None
             )
             
             # 执行单只股票分析（启用单股推送）
@@ -309,9 +473,21 @@ class AnalysisService:
                 with self._tasks_lock:
                     self._tasks[task_id].update({
                         "status": "completed",
-                        "end_time": datetime.now().isoformat(),
+                        "end_time": utc8_now().isoformat(),
                         "result": result_data
                     })
+
+                if stream_session:
+                    final_content = self._render_analyze_final_card(
+                        code=code,
+                        result=result_data,
+                        task_id=task_id,
+                        report_type=report_type.value,
+                        started_at=started_at,
+                        ok=True,
+                        version=stream_session.version + 1,
+                    )
+                    stream_session.finish(final_content)
                 
                 logger.info(f"[AnalysisService] 股票 {code} 分析完成: {result.operation_advice}")
                 return {"success": True, "task_id": task_id, "result": result_data}
@@ -319,9 +495,22 @@ class AnalysisService:
                 with self._tasks_lock:
                     self._tasks[task_id].update({
                         "status": "failed",
-                        "end_time": datetime.now().isoformat(),
+                        "end_time": utc8_now().isoformat(),
                         "error": "分析返回空结果"
                     })
+
+                if stream_session:
+                    final_content = self._render_analyze_final_card(
+                        code=code,
+                        result={},
+                        task_id=task_id,
+                        report_type=report_type.value,
+                        started_at=started_at,
+                        ok=False,
+                        error="分析返回空结果",
+                        version=stream_session.version + 1,
+                    )
+                    stream_session.finish(final_content)
                 
                 logger.warning(f"[AnalysisService] 股票 {code} 分析失败: 返回空结果")
                 return {"success": False, "task_id": task_id, "error": "分析返回空结果"}
@@ -333,11 +522,119 @@ class AnalysisService:
             with self._tasks_lock:
                 self._tasks[task_id].update({
                     "status": "failed",
-                    "end_time": datetime.now().isoformat(),
+                    "end_time": utc8_now().isoformat(),
                     "error": error_msg
                 })
+
+            try:
+                stream_session = locals().get("stream_session")
+                started_at = locals().get("started_at", utc8_now().isoformat())
+                if stream_session:
+                    final_content = self._render_analyze_final_card(
+                        code=code,
+                        result={},
+                        task_id=task_id,
+                        report_type=report_type.value,
+                        started_at=started_at,
+                        ok=False,
+                        error=error_msg,
+                        version=stream_session.version + 1,
+                    )
+                    stream_session.finish(final_content)
+            except Exception:
+                pass
             
             return {"success": False, "task_id": task_id, "error": error_msg}
+
+    @staticmethod
+    def _render_analyze_progress_card(
+        code: str,
+        report_type: str,
+        stage: str,
+        detail: str,
+        percent: int,
+        task_id: str,
+        started_at: str,
+        version: int,
+    ) -> str:
+        now = utc8_now()
+        try:
+            start_dt = datetime.fromisoformat(started_at)
+            elapsed = int((now - start_dt).total_seconds())
+        except Exception:
+            elapsed = 0
+        stage_map = {
+            "queued": "排队中",
+            "stock_start": "开始处理",
+            "fetch_start": "获取行情",
+            "fetch_done": "行情就绪",
+            "intel_search_start": "搜索情报",
+            "intel_search_done": "情报完成",
+            "llm_start": "AI 分析中",
+            "llm_done": "AI 分析完成",
+            "history_save": "写入历史",
+            "analyze_done": "分析完成",
+        }
+        stage_text = stage_map.get(stage, stage)
+        p = max(0, min(100, int(percent)))
+        return (
+            f"## 📈 分析进行中\n\n"
+            f"- 股票: `{code}`\n"
+            f"- 报告类型: `{report_type}`\n"
+            f"- 任务ID: `{task_id[:24]}...`\n"
+            f"- 进度: **{p}%**\n"
+            f"- 当前阶段: **{stage_text}**\n"
+            f"- 详情: {detail}\n"
+            f"- 已耗时: {elapsed}s\n\n"
+            f"`v{version}` | 更新时间: {now.strftime('%H:%M:%S')} (UTC+8)"
+        )
+
+    @staticmethod
+    def _render_analyze_final_card(
+        code: str,
+        result: Dict[str, Any],
+        task_id: str,
+        report_type: str,
+        started_at: str,
+        ok: bool,
+        error: Optional[str] = None,
+        version: int = 1,
+    ) -> str:
+        now = utc8_now()
+        try:
+            start_dt = datetime.fromisoformat(started_at)
+            elapsed = int((now - start_dt).total_seconds())
+        except Exception:
+            elapsed = 0
+        if ok:
+            name = result.get("name") or code
+            advice = result.get("operation_advice") or "-"
+            trend = result.get("trend_prediction") or "-"
+            score = result.get("sentiment_score")
+            summary = (result.get("analysis_summary") or "分析完成").strip()
+            if len(summary) > 120:
+                summary = summary[:120] + "..."
+            return (
+                f"## ✅ 分析完成\n\n"
+                f"- 股票: **{name}** (`{code}`)\n"
+                f"- 建议: **{advice}**\n"
+                f"- 趋势: {trend}\n"
+                f"- 评分: {score if score is not None else '-'}\n"
+                f"- 报告类型: `{report_type}`\n"
+                f"- 任务ID: `{task_id}`\n"
+                f"- 耗时: {elapsed}s\n\n"
+                f"摘要: {summary}\n\n"
+                f"`v{version}` | 完成时间: {now.strftime('%H:%M:%S')} (UTC+8)"
+            )
+        return (
+            f"## ❌ 分析失败\n\n"
+            f"- 股票: `{code}`\n"
+            f"- 报告类型: `{report_type}`\n"
+            f"- 任务ID: `{task_id}`\n"
+            f"- 耗时: {elapsed}s\n"
+            f"- 错误: {(error or '未知错误')[:160]}\n\n"
+            f"`v{version}` | 更新时间: {now.strftime('%H:%M:%S')} (UTC+8)"
+        )
 
 
 # ============================================================
@@ -352,3 +649,431 @@ def get_config_service() -> ConfigService:
 def get_analysis_service() -> AnalysisService:
     """获取分析服务单例"""
     return AnalysisService.get_instance()
+
+# ============================================================
+# 自选股服务
+# ============================================================
+
+class WatchlistService:
+    """
+    自选股管理服务
+    
+    负责：
+    1. 管理自选股 CRUD 操作
+    2. 按市场分组
+    3. 获取分析历史
+    """
+    
+    def __init__(self):
+        self.db = get_db()
+    
+    def add_stock(self, code: str, name: Optional[str] = None, market: str = "CN") -> Dict[str, Any]:
+        """添加自选股"""
+        try:
+            result = self.db.add_watchlist(code, name, market)
+            if result:
+                return {
+                    "success": True,
+                    "code": result.get("code"),
+                    "name": result.get("name"),
+                    "market": result.get("market")
+                }
+            else:
+                code_upper = (code or "").strip().upper()
+                exists = any(
+                    (getattr(item, "code", "") or "").upper() == code_upper
+                    for item in self.db.get_watchlist()
+                )
+                if exists:
+                    return {"success": False, "error": "股票已在自选股中"}
+                return {"success": False, "error": "未找到该股票的有效名称，请检查代码/市场是否正确"}
+        except Exception as e:
+            logger.error(f"添加自选股失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def remove_stock(self, code: str) -> Dict[str, Any]:
+        """删除自选股"""
+        try:
+            result = self.db.remove_watchlist(code)
+            return {"success": result}
+        except Exception as e:
+            logger.error(f"删除自选股失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def get_watchlist(self, market: Optional[str] = None) -> Dict[str, Any]:
+        """获取自选股列表"""
+        try:
+            watchlist = self.db.get_watchlist(market) if market else self.db.get_watchlist()
+            return {
+                "success": True,
+                "data": [item.to_dict() for item in watchlist]
+            }
+        except Exception as e:
+            logger.error(f"获取自选股列表失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def get_watchlist_grouped(self) -> Dict[str, Any]:
+        """按市场分组获取自选股"""
+        try:
+            grouped = self.db.get_watchlist_grouped()
+            return {
+                "success": True,
+                "data": {
+                    market: [item if isinstance(item, dict) else item.to_dict() for item in items]
+                    for market, items in grouped.items()
+                }
+            }
+        except Exception as e:
+            logger.error(f"获取分组自选股失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def get_stock_analysis(self, code: str, limit: int = 10) -> Dict[str, Any]:
+        """获取股票的历史分析报告"""
+        try:
+            history = self.db.get_analysis_history(code=code, limit=limit)
+            return {
+                "success": True,
+                "code": code,
+                "data": [item.to_dict() for item in history]
+            }
+        except Exception as e:
+            logger.error(f"获取分析历史失败: {e}")
+            return {"success": False, "error": str(e)}
+
+
+def get_watchlist_service() -> WatchlistService:
+    """获取自选股服务实例"""
+    return WatchlistService()
+
+
+class StockSearchService:
+    """
+    股票模糊搜索服务
+
+    特性：
+    1. 支持 A 股 / 港股 / 美股
+    2. 代码前缀匹配 + 名称包含匹配
+    3. 使用内存缓存减少重复外部请求
+    """
+
+    _instance: Optional['StockSearchService'] = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.db = get_db()
+        self._catalog_lock = threading.Lock()
+        self._catalog: Dict[str, List[Dict[str, str]]] = {
+            "CN": [],
+            "HK": [],
+            "US": [],
+        }
+        self._market_loaded: Dict[str, bool] = {
+            "CN": False,
+            "HK": False,
+            "US": False,
+        }
+        self._db_fallback_loaded = False
+
+    @classmethod
+    def get_instance(cls) -> 'StockSearchService':
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def search(self, keyword: str, market: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+        kw = (keyword or "").strip().upper()
+        if not kw:
+            return {"success": True, "data": []}
+
+        limit = max(1, min(limit, 50))
+        markets = [market.upper()] if market and market.upper() in {"CN", "HK", "US"} else ["CN", "HK", "US"]
+
+        # 先加载本地兜底（watchlist + 历史），保证快速可用
+        self._ensure_db_fallback_loaded()
+
+        candidates: List[Dict[str, str]] = []
+        for m in markets:
+            candidates.extend(self._catalog.get(m, []))
+
+        ranked = self._rank_and_filter(candidates, kw)
+        if len(ranked) >= min(5, limit):
+            return {"success": True, "data": ranked[:limit]}
+
+        # 若本地结果不足，再按需加载目标市场完整候选池
+        for m in markets:
+            self._ensure_market_loaded(m)
+            candidates.extend(self._catalog.get(m, []))
+
+        # 去重后重排
+        dedup: Dict[tuple, Dict[str, str]] = {}
+        for item in candidates:
+            key = (item.get("market"), item.get("code"))
+            dedup[key] = item
+
+        ranked = self._rank_and_filter(list(dedup.values()), kw)
+        return {"success": True, "data": ranked[:limit]}
+
+    def _ensure_market_loaded(self, market: str) -> None:
+        market = market.upper()
+        if market not in {"CN", "HK", "US"}:
+            return
+        if self._market_loaded.get(market):
+            return
+        with self._catalog_lock:
+            if self._market_loaded.get(market):
+                return
+            if market == "CN":
+                self._load_cn_catalog()
+            elif market == "HK":
+                self._load_hk_catalog()
+            else:
+                self._load_us_catalog()
+            self._market_loaded[market] = True
+
+    def _ensure_db_fallback_loaded(self) -> None:
+        if self._db_fallback_loaded:
+            return
+        with self._catalog_lock:
+            if self._db_fallback_loaded:
+                return
+            self._load_builtin_map()
+            self._load_db_fallback()
+            self._db_fallback_loaded = True
+
+    def _load_cn_catalog(self) -> None:
+        try:
+            merged: Dict[str, Dict[str, str]] = {}
+
+            # 优先使用 akshare 全市场列表（通常最稳定）
+            try:
+                import akshare as ak
+                if hasattr(ak, "stock_zh_a_spot_em"):
+                    df = ak.stock_zh_a_spot_em()
+                    if df is not None and not df.empty:
+                        rows = []
+                        for _, row in df.iterrows():
+                            code = str(row.get("代码", "")).strip()
+                            name = str(row.get("名称", "")).strip()
+                            if not code:
+                                continue
+                            rows.append({
+                                "code": code.zfill(6),
+                                "name": name or code.zfill(6),
+                                "market": "CN",
+                            })
+                        for item in rows:
+                            merged[item["code"]] = item
+            except Exception as e:
+                logger.debug(f"[StockSearch] akshare CN 列表加载失败: {e}")
+
+            # 复用已实现的 get_stock_list（Tushare/Baostock）
+            manager = DataFetcherManager()
+            for fetcher in getattr(manager, "_fetchers", []):
+                if not hasattr(fetcher, "get_stock_list"):
+                    continue
+                try:
+                    df = fetcher.get_stock_list()
+                    if df is None or df.empty:
+                        continue
+                    normalized = self._normalize_df(df, market="CN")
+                    for item in normalized:
+                        merged[item["code"]] = item
+                    if len(merged) >= 3000:
+                        break
+                except Exception as e:
+                    logger.debug(f"[StockSearch] CN 列表加载失败 ({fetcher.name}): {e}")
+            self._catalog["CN"] = list(merged.values())
+            logger.info(f"[StockSearch] CN 候选池加载完成: {len(self._catalog['CN'])}")
+        except Exception as e:
+            logger.warning(f"[StockSearch] CN 候选池加载异常: {e}")
+
+    def _load_hk_catalog(self) -> None:
+        try:
+            import akshare as ak
+            df = ak.stock_hk_spot_em()
+            if df is None or df.empty:
+                return
+            rows = []
+            for _, row in df.iterrows():
+                code = str(row.get("代码", "")).strip()
+                name = str(row.get("名称", "")).strip()
+                if not code:
+                    continue
+                rows.append({
+                    "code": f"HK{code.zfill(5)}",
+                    "name": name or f"HK{code.zfill(5)}",
+                    "market": "HK",
+                })
+            self._catalog["HK"] = rows
+            logger.info(f"[StockSearch] HK 候选池加载完成: {len(self._catalog['HK'])}")
+        except Exception as e:
+            logger.warning(f"[StockSearch] HK 候选池加载失败: {e}")
+
+    def _load_us_catalog(self) -> None:
+        # 可选：akshare 新版本通常提供 stock_us_spot_em，旧版本可能没有
+        try:
+            import akshare as ak
+            if not hasattr(ak, "stock_us_spot_em"):
+                return
+            df = ak.stock_us_spot_em()
+            if df is None or df.empty:
+                return
+            rows = []
+            for _, row in df.iterrows():
+                code = str(row.get("代码", "")).strip().upper()
+                name = str(row.get("名称", "")).strip()
+                if not code:
+                    continue
+                rows.append({
+                    "code": code,
+                    "name": name or code,
+                    "market": "US",
+                })
+            self._catalog["US"] = rows
+            logger.info(f"[StockSearch] US 候选池加载完成: {len(self._catalog['US'])}")
+        except Exception as e:
+            logger.warning(f"[StockSearch] US 候选池加载失败: {e}")
+
+    def _load_db_fallback(self) -> None:
+        # 将已有 watchlist + 历史分析补入候选池，确保至少能搜到“系统里出现过”的标的
+        existing = {(item["market"], item["code"]) for m in self._catalog.values() for item in m}
+        try:
+            watchlist = self.db.get_watchlist()
+            for item in watchlist:
+                d = item.to_dict()
+                code = (d.get("code") or "").upper()
+                market = (d.get("market") or "CN").upper()
+                if not code:
+                    continue
+                key = (market, code)
+                if key in existing:
+                    continue
+                self._catalog.setdefault(market, []).append({
+                    "code": code,
+                    "name": d.get("name") or code,
+                    "market": market,
+                })
+                existing.add(key)
+        except Exception as e:
+            logger.debug(f"[StockSearch] watchlist fallback 加载失败: {e}")
+
+        try:
+            # 仅取近期历史，避免过大
+            history = self.db.get_analysis_history(days=365, limit=2000)
+            for rec in history:
+                d = rec.to_dict()
+                code = (d.get("code") or "").upper()
+                name = (d.get("name") or "").strip()
+                if not code:
+                    continue
+                market = self._infer_market(code)
+                key = (market, code)
+                if key in existing:
+                    continue
+                self._catalog.setdefault(market, []).append({
+                    "code": code,
+                    "name": name or code,
+                    "market": market,
+                })
+                existing.add(key)
+        except Exception as e:
+            logger.debug(f"[StockSearch] history fallback 加载失败: {e}")
+
+    def _load_builtin_map(self) -> None:
+        """加载内置常见标的映射，保证离线时也有基本可用结果。"""
+        try:
+            from src.analyzer import STOCK_NAME_MAP
+        except Exception as e:
+            logger.debug(f"[StockSearch] 内置映射加载失败: {e}")
+            return
+
+        existing = {(item["market"], item["code"]) for m in self._catalog.values() for item in m}
+        for raw_code, name in STOCK_NAME_MAP.items():
+            code = (raw_code or "").strip().upper()
+            if not code:
+                continue
+
+            if re.match(r'^\d{6}$', code):
+                market = "CN"
+                normalized_code = code
+            elif re.match(r'^\d{5}$', code):
+                market = "HK"
+                normalized_code = f"HK{code}"
+            elif re.match(r'^HK\d{5}$', code):
+                market = "HK"
+                normalized_code = code
+            else:
+                market = "US"
+                normalized_code = code
+
+            key = (market, normalized_code)
+            if key in existing:
+                continue
+            self._catalog.setdefault(market, []).append({
+                "code": normalized_code,
+                "name": name or normalized_code,
+                "market": market,
+            })
+            existing.add(key)
+
+    @staticmethod
+    def _normalize_df(df: pd.DataFrame, market: str) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        if df is None or df.empty:
+            return rows
+        code_col = "code" if "code" in df.columns else None
+        name_col = "name" if "name" in df.columns else None
+        if not code_col:
+            return rows
+        for _, row in df.iterrows():
+            code = str(row.get(code_col, "")).strip().upper()
+            name = str(row.get(name_col, "")).strip() if name_col else ""
+            if not code:
+                continue
+            rows.append({
+                "code": code,
+                "name": name or code,
+                "market": market,
+            })
+        return rows
+
+    @staticmethod
+    def _infer_market(code: str) -> str:
+        if re.match(r'^\d{6}$', code):
+            return "CN"
+        if re.match(r'^HK\d{5}$', code):
+            return "HK"
+        return "US"
+
+    @staticmethod
+    def _rank_and_filter(candidates: List[Dict[str, str]], keyword: str) -> List[Dict[str, str]]:
+        def score(item: Dict[str, str]) -> int:
+            code = (item.get("code") or "").upper()
+            name = (item.get("name") or "").upper()
+            if code == keyword:
+                return 100
+            if code.startswith(keyword):
+                return 80
+            if keyword in code:
+                return 60
+            if name.startswith(keyword):
+                return 50
+            if keyword in name:
+                return 40
+            return 0
+
+        matched = []
+        for item in candidates:
+            s = score(item)
+            if s <= 0:
+                continue
+            matched.append((s, item))
+        matched.sort(key=lambda x: (-x[0], x[1].get("code", "")))
+        return [item for _, item in matched]
+
+
+def get_stock_search_service() -> StockSearchService:
+    """获取股票搜索服务单例"""
+    return StockSearchService.get_instance()

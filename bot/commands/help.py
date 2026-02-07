@@ -100,6 +100,20 @@ class HelpCommand(BotCommand):
             f"• {prefix}market - 查看大盘复盘",
             "",
             f"• {prefix}batch - 批量分析自选股",
+            "",
+            f"• {prefix}position set 腾讯控股 320 8 HK - 设置个人持仓",
+            "",
+            f"• {prefix}position batch TSM 180 12; NVDA 700 8 - 批量写入持仓",
+            "",
+            f"• {prefix}position total 1000000 - 设置组合总资产(人民币)",
+            "",
+            f"• {prefix}position fx 6.94 0.888 - 设置换算汇率",
+            "",
+            f"• {prefix}position sell TSM 188 30 - 卖出并自动扣减股数",
+            "",
+            f"• {prefix}pos fast - 快速查看持仓(不拉实时)",
+            "",
+            f"• {prefix}position clear - 清空全部持仓",
         ])
         
         return "\n".join(lines)

@@ -106,6 +106,15 @@ class TushareFetcher(BaseFetcher):
             
             # 获取 API 实例
             self._api = ts.pro_api()
+
+            # 可选：自定义 Tushare Pro HTTP URL（如加速/代理网关）
+            if config.tushare_http_url:
+                try:
+                    # DataApi 使用私有字段保存 URL
+                    self._api._DataApi__http_url = config.tushare_http_url
+                    logger.info(f"Tushare HTTP URL 已设置为: {config.tushare_http_url}")
+                except Exception as e:
+                    logger.warning(f"设置 Tushare HTTP URL 失败: {e}")
             
             logger.info("Tushare API 初始化成功")
             

@@ -45,6 +45,7 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tushare_http_url: Optional[str] = None
     
     # === AI 分析配置 ===
     gemini_api_key: Optional[str] = None
@@ -62,11 +63,17 @@ class Config:
     openai_base_url: Optional[str] = None  # 如: https://api.openai.com/v1
     openai_model: str = "gpt-4o-mini"  # OpenAI 兼容模型名称
     openai_temperature: float = 0.7  # OpenAI 温度参数（0.0-2.0，默认0.7）
-    
+    ai_max_output_tokens: int = 4096  # AI 最大输出 token 上限
+    ai_news_context_max_chars: int = 2200  # 新闻上下文最大字符数
+    ai_prompt_max_chars: int = 12000  # 单次分析 prompt 最大字符数
+
     # === 搜索引擎配置（支持多 Key 负载均衡）===
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
+    intel_max_items_per_dimension: int = 2  # 每个情报维度最多保留几条
+    intel_snippet_max_chars: int = 90  # 每条情报摘要最大字符数
+    intel_context_max_chars: int = 2200  # 情报上下文总长度上限
     
     # === 通知配置（可同时配置多个，全部推送）===
     
@@ -186,11 +193,21 @@ class Config:
     bot_rate_limit_requests: int = 10     # 频率限制：窗口内最大请求数
     bot_rate_limit_window: int = 60       # 频率限制：窗口时间（秒）
     bot_admin_users: List[str] = field(default_factory=list)  # 管理员用户 ID 列表
+    bot_analysis_chat_max_turns: int = 3  # 分析续聊保留轮数
+    bot_analysis_chat_quote_max_chars: int = 220  # 引用正文最大长度
+    bot_analysis_chat_base_context_max_chars: int = 800  # 基础分析上下文最大长度
+    bot_analysis_chat_history_q_max_chars: int = 120  # 历史提问最大长度
+    bot_analysis_chat_history_a_max_chars: int = 220  # 历史回答最大长度
+    bot_analysis_chat_prompt_max_chars: int = 3200  # 续聊 prompt 最大长度
     
     # 飞书机器人（事件订阅）- 已有 feishu_app_id, feishu_app_secret
     feishu_verification_token: Optional[str] = None  # 事件订阅验证 Token
     feishu_encrypt_key: Optional[str] = None         # 消息加密密钥（可选）
     feishu_stream_enabled: bool = False              # 是否启用 Stream 长连接模式（无需公网IP）
+    feishu_stream_card_enabled: bool = True          # 是否启用飞书流式卡片更新
+    feishu_stream_card_update_interval: float = 2.0  # 流式卡片刷新间隔（秒）
+    feishu_stream_card_max_updates: int = 120        # 单次任务最大卡片更新次数
+    feishu_stream_card_debug: bool = False           # 是否输出流式卡片调试日志
     
     # 钉钉机器人
     dingtalk_app_key: Optional[str] = None      # 应用 AppKey
@@ -319,6 +336,7 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_http_url=os.getenv('TUSHARE_HTTP_URL'),
             gemini_api_key=os.getenv('GEMINI_API_KEY'),
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-2.5-flash'),
@@ -330,9 +348,15 @@ class Config:
             openai_base_url=os.getenv('OPENAI_BASE_URL'),
             openai_model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
             openai_temperature=float(os.getenv('OPENAI_TEMPERATURE', '0.7')),
+            ai_max_output_tokens=int(os.getenv('AI_MAX_OUTPUT_TOKENS', '4096')),
+            ai_news_context_max_chars=int(os.getenv('AI_NEWS_CONTEXT_MAX_CHARS', '2200')),
+            ai_prompt_max_chars=int(os.getenv('AI_PROMPT_MAX_CHARS', '12000')),
             bocha_api_keys=bocha_api_keys,
             tavily_api_keys=tavily_api_keys,
             serpapi_keys=serpapi_keys,
+            intel_max_items_per_dimension=int(os.getenv('INTEL_MAX_ITEMS_PER_DIMENSION', '2')),
+            intel_snippet_max_chars=int(os.getenv('INTEL_SNIPPET_MAX_CHARS', '90')),
+            intel_context_max_chars=int(os.getenv('INTEL_CONTEXT_MAX_CHARS', '2200')),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -377,10 +401,20 @@ class Config:
             bot_rate_limit_requests=int(os.getenv('BOT_RATE_LIMIT_REQUESTS', '10')),
             bot_rate_limit_window=int(os.getenv('BOT_RATE_LIMIT_WINDOW', '60')),
             bot_admin_users=[u.strip() for u in os.getenv('BOT_ADMIN_USERS', '').split(',') if u.strip()],
+            bot_analysis_chat_max_turns=int(os.getenv('BOT_ANALYSIS_CHAT_MAX_TURNS', '3')),
+            bot_analysis_chat_quote_max_chars=int(os.getenv('BOT_ANALYSIS_CHAT_QUOTE_MAX_CHARS', '220')),
+            bot_analysis_chat_base_context_max_chars=int(os.getenv('BOT_ANALYSIS_CHAT_BASE_CONTEXT_MAX_CHARS', '800')),
+            bot_analysis_chat_history_q_max_chars=int(os.getenv('BOT_ANALYSIS_CHAT_HISTORY_Q_MAX_CHARS', '120')),
+            bot_analysis_chat_history_a_max_chars=int(os.getenv('BOT_ANALYSIS_CHAT_HISTORY_A_MAX_CHARS', '220')),
+            bot_analysis_chat_prompt_max_chars=int(os.getenv('BOT_ANALYSIS_CHAT_PROMPT_MAX_CHARS', '3200')),
             # 飞书机器人
             feishu_verification_token=os.getenv('FEISHU_VERIFICATION_TOKEN'),
             feishu_encrypt_key=os.getenv('FEISHU_ENCRYPT_KEY'),
             feishu_stream_enabled=os.getenv('FEISHU_STREAM_ENABLED', 'false').lower() == 'true',
+            feishu_stream_card_enabled=os.getenv('FEISHU_STREAM_CARD_ENABLED', 'true').lower() == 'true',
+            feishu_stream_card_update_interval=float(os.getenv('FEISHU_STREAM_CARD_UPDATE_INTERVAL', '2.0')),
+            feishu_stream_card_max_updates=int(os.getenv('FEISHU_STREAM_CARD_MAX_UPDATES', '120')),
+            feishu_stream_card_debug=os.getenv('FEISHU_STREAM_CARD_DEBUG', 'false').lower() == 'true',
             # 钉钉机器人
             dingtalk_app_key=os.getenv('DINGTALK_APP_KEY'),
             dingtalk_app_secret=os.getenv('DINGTALK_APP_SECRET'),

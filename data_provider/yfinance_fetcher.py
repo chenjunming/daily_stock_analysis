@@ -17,7 +17,7 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 import logging
 import re
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import pandas as pd
 from tenacity import (
@@ -298,6 +298,48 @@ class YfinanceFetcher(BaseFetcher):
         code = stock_code.strip().upper()
         return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
 
+    @staticmethod
+    def _pick_prev_close(
+        price: Optional[float],
+        fast_prev_close: Optional[float],
+        info_prev_close: Optional[float],
+        hist_prev_close: Optional[float],
+    ) -> Optional[float]:
+        """
+        从多个来源挑选最可信的昨收价。
+        优先原则：
+        1) 若有现价，选“最接近现价”的候选值（避免异常昨收导致日盈亏放大）
+        2) 若无现价，按 info -> hist -> fast 回退
+        """
+        candidates_info_hist: List[Tuple[str, float]] = []
+        for name, val in [
+            ("info", info_prev_close),
+            ("hist", hist_prev_close),
+        ]:
+            if val is not None:
+                try:
+                    fv = float(val)
+                    if fv > 0:
+                        candidates_info_hist.append((name, fv))
+                except Exception:
+                    continue
+
+        # 优先只在 info/hist 内部选择；fast 仅作为最后兜底
+        candidates = candidates_info_hist
+        if not candidates:
+            try:
+                if fast_prev_close is not None and float(fast_prev_close) > 0:
+                    return float(fast_prev_close)
+            except Exception:
+                pass
+            return None
+
+        if price is not None and float(price) > 0:
+            p = float(price)
+            candidates.sort(key=lambda x: abs(p - x[1]))
+            return candidates[0][1]
+        return candidates[0][1]
+
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取美股实时行情数据
@@ -322,6 +364,10 @@ class YfinanceFetcher(BaseFetcher):
             logger.debug(f"[Yfinance] 获取美股 {symbol} 实时行情")
             
             ticker = yf.Ticker(symbol)
+            raw_info: Dict[str, Any] = {}
+            info_prev_close: Optional[float] = None
+            hist_prev_close: Optional[float] = None
+            fast_prev_close: Optional[float] = None
             
             # 尝试获取 fast_info（更快，但字段较少）
             try:
@@ -331,6 +377,7 @@ class YfinanceFetcher(BaseFetcher):
                 
                 price = getattr(info, 'lastPrice', None) or getattr(info, 'last_price', None)
                 prev_close = getattr(info, 'previousClose', None) or getattr(info, 'previous_close', None)
+                fast_prev_close = float(prev_close) if prev_close is not None else None
                 open_price = getattr(info, 'open', None)
                 high = getattr(info, 'dayHigh', None) or getattr(info, 'day_high', None)
                 low = getattr(info, 'dayLow', None) or getattr(info, 'day_low', None)
@@ -355,6 +402,35 @@ class YfinanceFetcher(BaseFetcher):
                 low = float(today['Low'])
                 volume = int(today['Volume'])
                 market_cap = None
+
+            # 补充 info/hist 两路昨收候选，校准 fast_info 的异常 previousClose
+            try:
+                raw_info = ticker.info or {}
+                info_prev_close = raw_info.get('regularMarketPreviousClose') or raw_info.get('previousClose')
+                info_prev_close = float(info_prev_close) if info_prev_close is not None else None
+            except Exception:
+                info_prev_close = None
+            try:
+                hist_5d = ticker.history(period='5d', interval='1d')
+                if hist_5d is not None and not hist_5d.empty and 'Close' in hist_5d.columns:
+                    closes = [float(x) for x in hist_5d['Close'].dropna().tolist()]
+                    if len(closes) >= 2:
+                        hist_prev_close = closes[-2]
+            except Exception:
+                hist_prev_close = None
+
+            selected_prev = self._pick_prev_close(
+                price=float(price) if price is not None else None,
+                fast_prev_close=fast_prev_close,
+                info_prev_close=info_prev_close,
+                hist_prev_close=hist_prev_close,
+            )
+            if selected_prev is not None:
+                prev_close = selected_prev
+            logger.info(
+                f"[Yfinance] {symbol} 昨收候选 fast={fast_prev_close} info={info_prev_close} "
+                f"hist={hist_prev_close} -> selected={prev_close}"
+            )
             
             # 计算涨跌幅
             change_amount = None
@@ -370,7 +446,7 @@ class YfinanceFetcher(BaseFetcher):
             
             # 获取股票名称
             try:
-                name = ticker.info.get('shortName', '') or ticker.info.get('longName', '') or symbol
+                name = raw_info.get('shortName', '') or raw_info.get('longName', '') or symbol
             except Exception:
                 name = symbol
             

@@ -16,6 +16,7 @@
 
 import logging
 import random
+import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -382,8 +383,24 @@ class DataFetcherManager:
             DataFetchError: 所有数据源都失败时抛出
         """
         errors = []
-        
-        for fetcher in self._fetchers:
+
+        # 美股专用路由：仅使用 Yfinance/Akshare，且优先 Yfinance
+        is_us = bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', (stock_code or "").strip().upper()))
+        fetchers_to_try = self._fetchers
+        if is_us:
+            by_name = {f.name: f for f in self._fetchers}
+            fetchers_to_try = [
+                f for f in [
+                    by_name.get("YfinanceFetcher"),
+                    by_name.get("AkshareFetcher"),
+                ] if f is not None
+            ] or self._fetchers
+            logger.info(
+                f"[美股路由] {stock_code} 使用专用数据源链路: "
+                f"{' -> '.join(f.name for f in fetchers_to_try)}"
+            )
+
+        for fetcher in fetchers_to_try:
             try:
                 logger.info(f"尝试使用 [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(

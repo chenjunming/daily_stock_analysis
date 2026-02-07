@@ -963,6 +963,12 @@ class SearchService:
         Returns:
             格式化的情报报告文本
         """
+        from src.config import get_config
+        cfg = get_config()
+        max_items = max(1, int(getattr(cfg, "intel_max_items_per_dimension", 2)))
+        snippet_limit = max(30, int(getattr(cfg, "intel_snippet_max_chars", 90)))
+        context_limit = max(800, int(getattr(cfg, "intel_context_max_chars", 2200)))
+
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
@@ -982,19 +988,22 @@ class SearchService:
             elif dim_name == 'earnings': dim_desc = '📊 业绩预期'
             elif dim_name == 'industry': dim_desc = '🏭 行业分析'
             
-            lines.append(f"\n{dim_desc} (来源: {resp.provider}):")
+            lines.append(f"\n{dim_desc} ({resp.provider}):")
             if resp.success and resp.results:
-                # 增加显示条数
-                for i, r in enumerate(resp.results[:4], 1):
+                for i, r in enumerate(resp.results[:max_items], 1):
                     date_str = f" [{r.published_date}]" if r.published_date else ""
                     lines.append(f"  {i}. {r.title}{date_str}")
-                    # 如果摘要太短，可能信息量不足
-                    snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
-                    lines.append(f"     {snippet}...")
+                    snippet = (r.snippet or "").strip()
+                    if len(snippet) > snippet_limit:
+                        snippet = snippet[:snippet_limit].rstrip() + "..."
+                    lines.append(f"     {snippet or '无摘要'}")
             else:
                 lines.append("  未找到相关信息")
-        
-        return "\n".join(lines)
+
+        text = "\n".join(lines)
+        if len(text) > context_limit:
+            text = text[:context_limit].rstrip() + "\n\n[情报内容已按预算截断]"
+        return text
     
     def batch_search(
         self,
