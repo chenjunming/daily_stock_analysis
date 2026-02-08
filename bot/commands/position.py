@@ -751,7 +751,7 @@ class PositionCommand(BotCommand):
                 continue
             lines.append(f"**{self._market_name(market)}（{len(rows)}）**")
             # 5列表格，适配飞书 column_set 稳定渲染
-            lines.append("| 标的 | 成本/现价 | 股数 | 仓位 | 盈亏(总%/日) |")
+            lines.append("| 标的 | 成本/现价 | 股数 | 仓位 | 盈亏(总%/日%/日额) |")
             lines.append("|---|---|---:|---:|---|")
             for item in rows:
                 pnl = item["pnl_pct"]
@@ -759,9 +759,17 @@ class PositionCommand(BotCommand):
                 price_text = "N/A" if item["current_price"] is None else f"{item['current_price']:.4f}"
                 prefix = market_currency_prefix.get(item.get("market", market), "")
                 day_pnl_text = "N/A" if item.get("day_pnl") is None else f"{prefix}{float(item['day_pnl']):+.2f}"
+                day_change_pct = None
+                pre_close = item.get("pre_close")
+                if pre_close is not None and float(pre_close) > 0:
+                    if item.get("change_amount") is not None:
+                        day_change_pct = float(item["change_amount"]) / float(pre_close) * 100.0
+                    elif item.get("current_price") is not None:
+                        day_change_pct = (float(item["current_price"]) - float(pre_close)) / float(pre_close) * 100.0
+                day_change_text = "N/A" if day_change_pct is None else f"{day_change_pct:+.2f}%"
                 symbol = f"{item['name']} (`{item['code']}`)"
                 cost_price = f"{item['avg_cost']:.4f} / {price_text}"
-                pnl_mix = f"{pnl_text} / {day_pnl_text}"
+                pnl_mix = f"{pnl_text} / {day_change_text} / {day_pnl_text}"
                 lines.append(
                     f"| {symbol} | {cost_price} | {item['shares']:.4f} | "
                     f"{item['weight_pct']:.2f}% | {pnl_mix} |"

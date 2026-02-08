@@ -491,7 +491,6 @@ class CommandDispatcher:
             return None
         raw_event = (getattr(message, "raw_data", {}) or {}).get("event", {}) or {}
         referenced_text = str(raw_event.get("referenced_text", "") or "").strip()
-        referenced_message_id = str(raw_event.get("referenced_message_id", "") or "")
         raw_hint = self._extract_reply_quote_hint(message.raw_content or "")
         quote_context = self._clip_text(referenced_text or raw_hint, self._analysis_chat_quote_max_chars)
         has_quote_ref = bool(raw_event.get("parent_id") or raw_event.get("root_id") or raw_event.get("thread_id"))
@@ -575,7 +574,8 @@ class CommandDispatcher:
 
         prompt = (
             "你是股票分析助手，基于既有报告做续聊答疑。\n"
-            "要求：基于给定上下文回答；信息不足要明确缺口；输出简洁 Markdown；结尾加“风险提示：仅供参考，不构成投资建议”。\n\n"
+            "要求：基于给定上下文回答；信息不足要明确缺口；输出简洁 Markdown；结尾加“风险提示：仅供参考，不构成投资建议”。\n"
+            "强约束：禁止输出 JSON、禁止代码块、禁止以 { 或 [ 开头。若你准备输出结构化内容，请改写成条目式中文说明。\n\n"
             f"【引用正文】\n{quote_context or '无'}\n\n"
             f"【分析上下文】\n{base_context}\n\n"
             f"【同线程最近对话】\n{history_text}\n\n"
@@ -585,9 +585,9 @@ class CommandDispatcher:
         try:
             answer = analyzer._call_api_with_retry(
                 prompt,
-                generation_config={"temperature": 0.3, "max_output_tokens": 900},
+                generation_config={"temperature": 0.3, "max_output_tokens": 10240},
             )
-            answer = (answer or "").strip()
+            answer = self._normalize_chat_answer((answer or "").strip())
             if not answer:
                 return None
 
@@ -605,19 +605,6 @@ class CommandDispatcher:
                     "turns": new_turns,
                     "updated_at": time.time(),
                 }
-            if has_quote_ref:
-                quote_preview = (quote_context or "").replace("\n", " ").strip()
-                if len(quote_preview) > 220:
-                    quote_preview = quote_preview[:220] + "..."
-                debug_lines = [
-                    "### 调试信息",
-                    f"- 引用消息ID: `{referenced_message_id or 'N/A'}`",
-                    f"- 引用正文长度: `{len(quote_context or '')}`",
-                    f"- 引用正文片段: `{quote_preview or 'N/A'}`",
-                    f"- 提取代码: `{', '.join(probable_codes[:8]) if probable_codes else 'N/A'}`",
-                    f"- 选中代码: `{selected_code or 'N/A'}`",
-                ]
-                answer = "\n".join(debug_lines) + "\n\n" + answer
             return BotResponse.markdown_response(answer, at_user=True)
         except Exception as e:
             logger.debug(f"[Dispatcher] 分析续聊失败: {e}")
@@ -689,16 +676,17 @@ class CommandDispatcher:
         prompt = (
             "你是股票分析助手。用户在追问上一条分析结果。"
             "请直接给出简洁、可执行的回答；若信息不足，明确说明缺哪些数据。"
-            "输出 Markdown；结尾附一句：风险提示：仅供参考，不构成投资建议。\n\n"
+            "输出 Markdown；结尾附一句：风险提示：仅供参考，不构成投资建议。"
+            "强约束：禁止输出 JSON、禁止代码块、禁止以 { 或 [ 开头。\n\n"
             f"引用正文：{quote_context or '无'}\n"
             f"用户问题：{text}"
         )
         try:
             answer = analyzer._call_api_with_retry(
                 prompt,
-                generation_config={"temperature": 0.3, "max_output_tokens": 700},
+                generation_config={"temperature": 0.3, "max_output_tokens": 10240},
             )
-            answer = (answer or "").strip()
+            answer = self._normalize_chat_answer((answer or "").strip())
             if not answer:
                 return None
             return BotResponse.markdown_response(answer, at_user=True)
@@ -1081,6 +1069,57 @@ class CommandDispatcher:
         if m:
             return m.group(0)
         return "{}"
+
+    def _normalize_chat_answer(self, text: str) -> str:
+        """
+        续聊问答的输出清洗：
+        - 正常 Markdown：原样返回
+        - 若模型误返回 JSON：提炼成简洁 Markdown，避免飞书展示大段代码块
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        json_text = self._extract_json_text(raw)
+        try:
+            data = json.loads(json_text)
+        except Exception:
+            return raw
+        if not isinstance(data, dict) or not data:
+            return raw
+
+        dashboard = data.get("dashboard", {})
+        core = dashboard.get("core_conclusion", {}) if isinstance(dashboard, dict) else {}
+        position_advice = core.get("position_advice", {}) if isinstance(core, dict) else {}
+
+        stock_name = str(data.get("stock_name") or "").strip()
+        operation_advice = str(data.get("operation_advice") or "").strip()
+        trend_prediction = str(data.get("trend_prediction") or "").strip()
+        one_sentence = str(core.get("one_sentence") or data.get("analysis_summary") or "").strip()
+        no_position = str(position_advice.get("no_position") or "").strip()
+        has_position = str(position_advice.get("has_position") or "").strip()
+        risk_warning = str(data.get("risk_warning") or "").strip()
+
+        lines: List[str] = []
+        if stock_name:
+            lines.append(f"### {stock_name} 分析续聊")
+            lines.append("")
+        if one_sentence:
+            lines.append(one_sentence)
+        if operation_advice or trend_prediction:
+            lines.append(
+                f"建议：{operation_advice or '观望'}"
+                + (f"｜趋势：{trend_prediction}" if trend_prediction else "")
+            )
+        if has_position:
+            lines.append(f"持仓者：{has_position}")
+        if no_position:
+            lines.append(f"空仓者：{no_position}")
+        if risk_warning:
+            lines.append(f"风险点：{risk_warning}")
+
+        if not any("风险提示：仅供参考，不构成投资建议" in x for x in lines):
+            lines.append("风险提示：仅供参考，不构成投资建议。")
+        return "\n".join([x for x in lines if x]).strip() or raw
 
     def _infer_intent_with_rules(self, text: str) -> Dict[str, Any]:
         """关键词兜底意图识别。"""

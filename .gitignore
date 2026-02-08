@@ -62,6 +62,9 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Docker buildx cache
+.buildx-cache/
+
 local/
 
 run.sh

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# bash scripts/build_and_push_arm64.sh --push --builder default
 
 IMAGE=""
 TAG=""
@@ -7,6 +8,13 @@ DOCKERFILE="docker/Dockerfile"
 CONTEXT="."
 PLATFORM="linux/arm64"
 BUILDER="local-multiarch"
+CACHE_ENABLED=true
+CACHE_DIR=".buildx-cache"
+CACHE_FROM=""
+CACHE_TO=""
+PIP_INDEX_URL=""
+PIP_EXTRA_INDEX_URL=""
+PIP_TRUSTED_HOST=""
 QUICK_PUSH=false
 QUICK_PULL=false
 QUICK_PULL_ARM64=false
@@ -35,6 +43,13 @@ Optional:
   --context       Build context path (default: .)
   --platform      Target platform (default: linux/arm64)
   --builder       buildx builder name (default: local-multiarch)
+  --cache-dir     Local buildx cache directory (default: .buildx-cache)
+  --cache-from    buildx cache-from value, e.g. type=registry,ref=repo/image:buildcache
+  --cache-to      buildx cache-to value, e.g. type=registry,ref=repo/image:buildcache,mode=max
+  --no-cache-use  Disable buildx cache import/export
+  --pip-index-url       Pip index URL for faster dependency download
+  --pip-extra-index-url Extra pip index URL
+  --pip-trusted-host    Trusted host for pip index (e.g. pypi.tuna.tsinghua.edu.cn)
   -h, --help      Show this help
 
 Examples:
@@ -84,6 +99,34 @@ while [[ $# -gt 0 ]]; do
       ;;
     --builder)
       BUILDER="${2:-}"
+      shift 2
+      ;;
+    --cache-dir)
+      CACHE_DIR="${2:-}"
+      shift 2
+      ;;
+    --cache-from)
+      CACHE_FROM="${2:-}"
+      shift 2
+      ;;
+    --cache-to)
+      CACHE_TO="${2:-}"
+      shift 2
+      ;;
+    --no-cache-use)
+      CACHE_ENABLED=false
+      shift
+      ;;
+    --pip-index-url)
+      PIP_INDEX_URL="${2:-}"
+      shift 2
+      ;;
+    --pip-extra-index-url)
+      PIP_EXTRA_INDEX_URL="${2:-}"
+      shift 2
+      ;;
+    --pip-trusted-host)
+      PIP_TRUSTED_HOST="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -151,41 +194,117 @@ if [[ ! -d "$CONTEXT" ]]; then
   exit 1
 fi
 
-if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
-  echo "Creating buildx builder: $BUILDER"
-  docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
-fi
+ensure_builder() {
+  if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+    echo "Creating buildx builder: $BUILDER"
+    docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
+  fi
 
-docker buildx use "$BUILDER"
-docker buildx inspect --bootstrap >/dev/null
+  docker buildx use "$BUILDER"
+  if ! docker buildx inspect "$BUILDER" --bootstrap >/dev/null 2>&1; then
+    echo "Warning: builder bootstrap failed, recreating: $BUILDER"
+    docker rm -f "buildx_buildkit_${BUILDER}0" >/dev/null 2>&1 || true
+    docker buildx rm "$BUILDER" >/dev/null 2>&1 || true
+    docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
+    docker buildx use "$BUILDER"
+    docker buildx inspect "$BUILDER" --bootstrap >/dev/null
+  fi
+}
 
-if ! docker buildx inspect | grep -q "$PLATFORM"; then
+ensure_builder
+
+if ! docker buildx inspect "$BUILDER" | grep -q "$PLATFORM"; then
   echo "Installing binfmt for arm64 emulation..."
   docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null
-  docker buildx inspect --bootstrap >/dev/null
+  # buildkit container needs restart to pick up new binfmt handlers.
+  echo "Recreating builder to refresh supported platforms..."
+  docker rm -f "buildx_buildkit_${BUILDER}0" >/dev/null 2>&1 || true
+  docker buildx rm "$BUILDER" >/dev/null 2>&1 || true
+  docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
+  ensure_builder
 fi
 
-if ! docker buildx inspect | grep -q "$PLATFORM"; then
+if ! docker buildx inspect "$BUILDER" | grep -q "$PLATFORM"; then
   echo "Error: buildx builder does not support $PLATFORM." >&2
   exit 1
 fi
 
+INSPECT_TEXT="$(docker buildx inspect "$BUILDER")"
+BUILD_DRIVER="$(printf '%s\n' "$INSPECT_TEXT" | awk -F': *' '/^Driver:/{print $2; exit}')"
+
 IMAGE_REF="${IMAGE}:${TAG}"
+BUILD_ARGS=(
+  --platform "$PLATFORM"
+  -f "$DOCKERFILE"
+  -t "$IMAGE_REF"
+  --push
+)
+
+if [[ -n "$PIP_INDEX_URL" ]]; then
+  BUILD_ARGS+=(--build-arg "PIP_INDEX_URL=$PIP_INDEX_URL")
+fi
+if [[ -n "$PIP_EXTRA_INDEX_URL" ]]; then
+  BUILD_ARGS+=(--build-arg "PIP_EXTRA_INDEX_URL=$PIP_EXTRA_INDEX_URL")
+fi
+if [[ -n "$PIP_TRUSTED_HOST" ]]; then
+  BUILD_ARGS+=(--build-arg "PIP_TRUSTED_HOST=$PIP_TRUSTED_HOST")
+fi
+
+if [[ "$CACHE_ENABLED" == "true" ]]; then
+  CACHE_BACKEND_SUPPORTED=true
+  # docker driver 默认不支持 cache export（除非开启 containerd image store）
+  # 避免直接报错中断，自动降级为不传 cache 参数。
+  if [[ "$BUILD_DRIVER" == "docker" ]]; then
+    echo "Warning: builder '$BUILDER' uses docker driver; skipping --cache-from/--cache-to." >&2
+    echo "Hint: use --builder local-multiarch (docker-container) for full cache import/export." >&2
+    CACHE_BACKEND_SUPPORTED=false
+    CACHE_FROM=""
+    CACHE_TO=""
+  fi
+
+  if [[ "$CACHE_BACKEND_SUPPORTED" == "true" ]]; then
+    if [[ -z "$CACHE_TO" ]]; then
+      CACHE_TO="type=local,dest=${CACHE_DIR},mode=max"
+    fi
+
+    if [[ -z "$CACHE_FROM" ]]; then
+      mkdir -p "$CACHE_DIR"
+      if [[ -f "${CACHE_DIR}/index.json" ]]; then
+        CACHE_FROM="type=local,src=${CACHE_DIR}"
+      fi
+    fi
+
+    if [[ -n "$CACHE_FROM" ]]; then
+      BUILD_ARGS+=(--cache-from "$CACHE_FROM")
+    fi
+    if [[ -n "$CACHE_TO" ]]; then
+      BUILD_ARGS+=(--cache-to "$CACHE_TO")
+    fi
+  fi
+fi
 
 echo "Building and pushing image: $IMAGE_REF"
 echo "Platform: $PLATFORM"
 echo "Dockerfile: $DOCKERFILE"
 echo "Context: $CONTEXT"
+if [[ "$CACHE_ENABLED" == "true" ]]; then
+  echo "Cache: enabled"
+  echo "Cache-from: ${CACHE_FROM:-<none(first build)>}"
+  echo "Cache-to: ${CACHE_TO:-<none>}"
+else
+  echo "Cache: disabled"
+fi
+if [[ -n "$PIP_INDEX_URL" ]]; then
+  echo "Pip index: $PIP_INDEX_URL"
+fi
+if [[ -n "$PIP_EXTRA_INDEX_URL" ]]; then
+  echo "Pip extra index: $PIP_EXTRA_INDEX_URL"
+fi
 echo
 echo "Tip: ensure you have logged in to registry first (docker login ...)."
 echo
 
-docker buildx build \
-  --platform "$PLATFORM" \
-  -f "$DOCKERFILE" \
-  -t "$IMAGE_REF" \
-  --push \
-  "$CONTEXT"
+docker buildx build --builder "$BUILDER" "${BUILD_ARGS[@]}" "$CONTEXT"
 
 echo
 echo "Done: $IMAGE_REF"

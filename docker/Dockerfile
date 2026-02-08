@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # ===================================
 # A股自选股智能分析系统 - Docker 镜像
 # ===================================
@@ -10,19 +11,32 @@ WORKDIR /app
 
 # 设置时区为上海
 ENV TZ=Asia/Shanghai
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 安装系统依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    curl
 
 # 复制依赖文件
 COPY requirements.txt .
 
+# 可选：通过 build-arg 指定 pip 镜像/额外源
+ARG PIP_INDEX_URL=""
+ARG PIP_EXTRA_INDEX_URL=""
+ARG PIP_TRUSTED_HOST=""
+
 # 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eux; \
+    PIP_ARGS="--prefer-binary -r requirements.txt"; \
+    if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS --index-url $PIP_INDEX_URL"; fi; \
+    if [ -n "$PIP_EXTRA_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS --extra-index-url $PIP_EXTRA_INDEX_URL"; fi; \
+    if [ -n "$PIP_TRUSTED_HOST" ]; then PIP_ARGS="$PIP_ARGS --trusted-host $PIP_TRUSTED_HOST"; fi; \
+    pip install $PIP_ARGS
 
 # 复制应用代码
 COPY *.py ./

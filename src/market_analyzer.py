@@ -190,6 +190,7 @@ class MarketAnalyzer:
             "code": code,
             "name": code,
             "current": None,
+            "pct_chg": None,
             "ma20": None,
             "ma50": None,
             "pct_vs_ma20": None,
@@ -203,13 +204,19 @@ class MarketAnalyzer:
                 return out
             latest = df.iloc[-1]
             close = self._to_float(latest.get("close"))
+            pct_chg = self._to_float(latest.get("pct_chg"))
             ma20 = self._to_float(latest.get("ma20"))
             ma50 = self._to_float(df["close"].rolling(window=50, min_periods=20).mean().iloc[-1])
             volume_ratio = self._to_float(latest.get("volume_ratio"))
             rsi12 = self._calc_rsi(df["close"], period=12)
+            if pct_chg is None and close is not None and len(df) > 1:
+                prev_close = self._to_float(df["close"].iloc[-2])
+                if prev_close is not None and prev_close > 0:
+                    pct_chg = (close - prev_close) / prev_close * 100
             out.update(
                 {
                     "current": close,
+                    "pct_chg": pct_chg,
                     "ma20": ma20,
                     "ma50": ma50,
                     "volume_ratio": volume_ratio,
@@ -481,7 +488,7 @@ class MarketAnalyzer:
             )
             out = self.analyzer._call_api_with_retry(
                 prompt,
-                generation_config={"temperature": 0.0, "max_output_tokens": 900},
+                generation_config={"temperature": 0.0, "max_output_tokens": 10240},
             )
             payload = json.loads(self._extract_json_text(str(out or "")))
             items = payload.get("items", [])
@@ -576,7 +583,7 @@ class MarketAnalyzer:
 
             out = self.analyzer._call_api_with_retry(
                 prompt,
-                generation_config={"temperature": 0.0, "max_output_tokens": 320},
+                generation_config={"temperature": 0.0, "max_output_tokens": 10240},
             )
             payload = json.loads(self._extract_json_text(str(out or "")))
             macro = self._normalize_event_text(str(payload.get("macro", "") or "暂无高置信宏观信号"), max_len=72)
@@ -721,6 +728,7 @@ class MarketAnalyzer:
                     "weight_pct": self._to_float(getattr(row, "weight_pct", None)),
                     "current": current,
                     "pnl_pct": pnl,
+                    "day_change_pct": self._to_float(snap.get("pct_chg")),
                     "action": action,
                     "trigger": trigger,
                     "volume_ratio": vol,
@@ -945,14 +953,15 @@ class MarketAnalyzer:
         lines.append("## ⑤ 当前持仓建议表（含成本与触发器）")
         lines.append("")
         hold_rows = self._build_holding_rows(owner_key, allowed_markets=scope)
-        lines.append("| 标的 | 成本/现价/盈亏 | 当前仓位 | 建议(加/减/持) | 价位/量能/RSI触发器 |")
+        lines.append("| 标的 | 成本/现价/总盈亏/当日涨跌 | 当前仓位 | 建议(加/减/持) | 价位/量能/RSI触发器 |")
         lines.append("|---|---|---:|---|---|")
         if not hold_rows:
             lines.append("| - | - | - | 无持仓数据 | 使用 `/position set 代码 成本 仓位%` 后可显示个性化建议 |")
         else:
             for r in hold_rows[:20]:
                 price_info = (
-                    f"{self._fmt_num(r.get('avg_cost'))} / {self._fmt_num(r.get('current'))} / {self._fmt_pct(r.get('pnl_pct'))}"
+                    f"{self._fmt_num(r.get('avg_cost'))} / {self._fmt_num(r.get('current'))} / "
+                    f"{self._fmt_pct(r.get('pnl_pct'))} / {self._fmt_pct(r.get('day_change_pct'))}"
                 )
                 lines.append(
                     f"| {r.get('name')}({r.get('code')}) | {price_info} | {self._fmt_num(r.get('weight_pct'), 1)}% | "

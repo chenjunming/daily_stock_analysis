@@ -63,7 +63,7 @@ class Config:
     openai_base_url: Optional[str] = None  # 如: https://api.openai.com/v1
     openai_model: str = "gpt-4o-mini"  # OpenAI 兼容模型名称
     openai_temperature: float = 0.7  # OpenAI 温度参数（0.0-2.0，默认0.7）
-    ai_max_output_tokens: int = 4096  # AI 最大输出 token 上限
+    ai_max_output_tokens: int = 10240  # AI 最大输出 token 上限
     ai_news_context_max_chars: int = 2200  # 新闻上下文最大字符数
     ai_prompt_max_chars: int = 12000  # 单次分析 prompt 最大字符数
 
@@ -348,7 +348,7 @@ class Config:
             openai_base_url=os.getenv('OPENAI_BASE_URL'),
             openai_model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
             openai_temperature=float(os.getenv('OPENAI_TEMPERATURE', '0.7')),
-            ai_max_output_tokens=int(os.getenv('AI_MAX_OUTPUT_TOKENS', '4096')),
+            ai_max_output_tokens=int(os.getenv('AI_MAX_OUTPUT_TOKENS', '10240')),
             ai_news_context_max_chars=int(os.getenv('AI_NEWS_CONTEXT_MAX_CHARS', '2200')),
             ai_prompt_max_chars=int(os.getenv('AI_PROMPT_MAX_CHARS', '12000')),
             bocha_api_keys=bocha_api_keys,
