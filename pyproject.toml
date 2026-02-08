@@ -1,3 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daily-stock-analysis"
+version = "0.1.0"
+description = "Stock and market data analysis toolkit with reusable fetch APIs."
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+
+[project.scripts]
+fetch-market-data = "stock_data_fetcher.cli:main"
+stock-data-fetcher-mcp = "stock_data_fetcher.mcp_server:main"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stock_data_fetcher*", "data_provider*", "src*"]
+
 [tool.black]
 line-length = 120
 target-version = ['py310', 'py311', 'py312']

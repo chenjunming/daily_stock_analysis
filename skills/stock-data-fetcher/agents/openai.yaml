@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Data Fetcher"
+  short_description: "Unified stock/market data fetch for AI workflows"
+  default_prompt: "Use $stock-data-fetcher to fetch daily/realtime/chip/name and market breadth data as stable JSON."
