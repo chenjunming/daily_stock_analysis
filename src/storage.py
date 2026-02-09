@@ -1075,7 +1075,7 @@ class DatabaseManager:
         if input_name and input_name.upper() == code:
             input_name = ""
         
-        # 严格模式：必须能确认“代码 -> 名称”映射，才能入库
+        # 优先尝试从数据源反查标准名称
         resolved_from_source = self._resolve_watchlist_name(code, market)
         if resolved_from_source and resolved_from_source.upper() == code:
             resolved_from_source = None
@@ -1084,11 +1084,11 @@ class DatabaseManager:
             # 调用方已完成名称匹配验证（例如通过名称搜索命中）
             resolved_name = input_name
         else:
-            resolved_name = resolved_from_source
+            resolved_name = resolved_from_source or input_name or code
 
-        if not resolved_name:
-            logger.warning(f"添加自选股失败：无法确认股票名称 code={code}, market={market}")
-            return None
+        # 允许降级使用代码入库，避免外部名称源短时不可用导致无法添加港股/美股
+        if resolved_name.upper() == code:
+            logger.warning(f"添加自选股降级为代码名: code={code}, market={market}")
 
         with self.get_session() as session:
             try:

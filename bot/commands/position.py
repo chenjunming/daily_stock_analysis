@@ -43,6 +43,7 @@ class PositionCommand(BotCommand):
         /position clear
         /position remove 腾讯控股
         /position list fast
+        /position sync longport
         /pset 600519 1680 12
         /ptotal 1000000
         /pfx 6.94 0.888
@@ -67,7 +68,7 @@ class PositionCommand(BotCommand):
 
     @property
     def usage(self) -> str:
-        return "/position <list|set|batch|total|fx|sell|remove|clear> ... [fast]"
+        return "/position <list|set|batch|total|fx|sell|remove|clear|sync longport> ... [fast]"
 
     def execute(self, message: BotMessage, args: List[str]) -> BotResponse:
         owner_key = self._build_owner_key(message)
@@ -117,6 +118,8 @@ class PositionCommand(BotCommand):
             return self._clear_positions(owner_key, message)
         if action in {"remove", "rm", "del", "delete", "删除", "移除"}:
             return self._remove_position(owner_key, payload, message)
+        if action in {"sync", "import", "同步", "导入"}:
+            return self._sync_positions(owner_key, payload, message)
 
         # 兼容无 action：默认 set
         return self._set_position(owner_key, args, message)
@@ -707,8 +710,10 @@ class PositionCommand(BotCommand):
             pre_close = q.get("pre_close")
             change_amount = q.get("change_amount")
             pnl_pct = None
-            if price and row.avg_cost > 0:
-                pnl_pct = (price - row.avg_cost) / row.avg_cost * 100.0
+            avg_cost = float(row.avg_cost or 0.0)
+            avg_cost_abs = abs(avg_cost)
+            if price and avg_cost_abs > 0:
+                pnl_pct = (float(price) - avg_cost_abs) / avg_cost_abs * 100.0
             shares = float(getattr(row, "shares", 0) or 0.0)
             day_pnl = None
             if shares > 0:
@@ -741,6 +746,7 @@ class PositionCommand(BotCommand):
                 "change_amount": change_amount,
                 "pnl_pct": pnl_pct,
                 "day_pnl": day_pnl,
+                "price_session": q.get("price_session"),
             })
             total_weight += float(row.weight_pct or 0.0)
 
@@ -768,7 +774,9 @@ class PositionCommand(BotCommand):
                         day_change_pct = (float(item["current_price"]) - float(pre_close)) / float(pre_close) * 100.0
                 day_change_text = "N/A" if day_change_pct is None else f"{day_change_pct:+.2f}%"
                 symbol = f"{item['name']} (`{item['code']}`)"
-                cost_price = f"{item['avg_cost']:.4f} / {price_text}"
+                session_tag = self._price_session_text(item.get("price_session"))
+                price_with_session = f"{price_text}{session_tag}" if price_text != "N/A" else price_text
+                cost_price = f"{float(item['avg_cost'] or 0.0):.4f} / {price_with_session}"
                 pnl_mix = f"{pnl_text} / {day_change_text} / {day_pnl_text}"
                 lines.append(
                     f"| {symbol} | {cost_price} | {item['shares']:.4f} | "
@@ -793,6 +801,222 @@ class PositionCommand(BotCommand):
         if total_weight > 100:
             lines.append("⚠️ 总仓位已超过 100%，请注意风险控制。")
         return BotResponse.markdown_response("\n".join(lines))
+
+    def _sync_positions(self, owner_key: str, payload: List[str], message: BotMessage) -> BotResponse:
+        """
+        同步外部券商持仓到本地，目前支持 Longport。
+        """
+        target = (payload[0].strip().lower() if payload else "longport")
+        if target not in {"longport", "长桥", "lb"}:
+            return BotResponse.error_response("暂仅支持 `/position sync longport`")
+        return self._sync_longport_positions(owner_key, message)
+
+    def _sync_longport_positions(self, owner_key: str, message: BotMessage) -> BotResponse:
+        db = get_db()
+        positions, err = self._fetch_longport_stock_positions()
+        if err:
+            return BotResponse.error_response(f"长桥持仓同步失败: {err}")
+        if not positions:
+            return BotResponse.markdown_response("📭 长桥当前无股票持仓。")
+
+        code_market_map = {p["code"]: p["market"] for p in positions}
+        quotes = self._fetch_quote_snapshots([p["code"] for p in positions], code_market_map=code_market_map)
+
+        cfg = db.get_portfolio_user_config(owner_key)
+        total_asset_cny = float(cfg.get("total_asset_cny") or 0.0)
+        usd_cny = float(cfg.get("usd_cny") or 6.94)
+        hkd_cny = float(cfg.get("hkd_cny") or 0.888)
+
+        prepared: List[Dict[str, Any]] = []
+        for p in positions:
+            code = p["code"]
+            market = p["market"]
+            shares = float(p["shares"] or 0.0)
+            avg_cost = float(p["avg_cost"] or 0.0)
+            if shares <= 0:
+                continue
+            if avg_cost <= 0:
+                # 长桥返回成本缺失时，回退现价作为占位成本，避免写入失败
+                avg_cost = float((quotes.get(code) or {}).get("price") or 0.0)
+            if avg_cost <= 0:
+                continue
+
+            price = float((quotes.get(code) or {}).get("price") or 0.0)
+            ref_price = price if price > 0 else avg_cost
+            fx = 1.0
+            if market == "US":
+                fx = usd_cny
+            elif market == "HK":
+                fx = hkd_cny
+            value_cny = ref_price * shares * fx
+            prepared.append({
+                "code": code,
+                "name": p["name"] or code,
+                "market": market,
+                "shares": shares,
+                "avg_cost": avg_cost,
+                "value_cny": value_cny,
+            })
+
+        if not prepared:
+            return BotResponse.error_response("长桥持仓同步失败：未获取到可写入的有效持仓（成本/股数为空）")
+
+        weight_map = self._build_sync_weight_map(prepared, total_asset_cny=total_asset_cny)
+        normalized_by_value = bool(weight_map.get("_normalized_by_value"))
+
+        success_rows: List[str] = []
+        failed_rows: List[str] = []
+        for item in prepared:
+            code = item["code"]
+            weight_pct = float(weight_map.get(code) or 0.0)
+            if weight_pct <= 0:
+                failed_rows.append(f"{code} -> 仓位计算为 0，已跳过")
+                continue
+            result = db.upsert_holding(
+                owner_key=owner_key,
+                code=code,
+                name=item["name"],
+                market=item["market"],
+                avg_cost=float(item["avg_cost"]),
+                shares=float(item["shares"]),
+                weight_pct=weight_pct,
+                operator=f"{message.platform}:{message.user_id}:sync_longport",
+                verified=True,
+            )
+            if result.get("success"):
+                action = "新增" if result.get("action") == "add" else "更新"
+                success_rows.append(
+                    f"{action} {item['name']} (`{code}`) | 股数 `{item['shares']:.4f}` | "
+                    f"成本 `{item['avg_cost']:.4f}` | 仓位 `{weight_pct:.2f}%`"
+                )
+            else:
+                failed_rows.append(f"{code} -> {result.get('error', '写入失败')}")
+
+        profile = db.get_portfolio_profile(owner_key)
+        lines = [
+            "✅ **长桥持仓同步完成**",
+            "",
+            f"• 成功: `{len(success_rows)}`",
+            f"• 失败: `{len(failed_rows)}`",
+            f"• 同步源: `Longport Trade API`",
+            f"• 当前组合总仓位: `{float(profile.get('total_weight_pct') or 0.0):.2f}%`",
+        ]
+        if total_asset_cny <= 0:
+            lines.append("• 仓位计算: 未设置总资产，已按持仓市值占比归一化到 100%")
+        elif normalized_by_value:
+            lines.append("• 仓位计算: 检测到总仓位超限，已按持仓市值占比归一化到 100%")
+        else:
+            lines.append(f"• 仓位计算: 按总资产 `{total_asset_cny:.2f} CNY` 换算")
+
+        lines.append("")
+        lines.append("**成功明细**")
+        lines.extend([f"• {row}" for row in success_rows[:40]])
+        if failed_rows:
+            lines.extend(["", "**失败明细**"])
+            lines.extend([f"• {row}" for row in failed_rows[:20]])
+        return BotResponse.markdown_response("\n".join(lines))
+
+    def _fetch_longport_stock_positions(self) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        try:
+            from src.config import get_config
+            from longport.openapi import Config as LongportConfig, TradeContext
+        except Exception as e:
+            return [], f"缺少 longport 依赖: {e}"
+
+        cfg = get_config()
+        app_key = (cfg.longport_app_key or "").strip()
+        app_secret = (cfg.longport_app_secret or "").strip()
+        access_token = (cfg.longport_access_token or "").strip()
+        if not (app_key and app_secret and access_token):
+            return [], "请先配置 LONGPORT_APP_KEY / LONGPORT_APP_SECRET / LONGPORT_ACCESS_TOKEN"
+
+        try:
+            lp_cfg = LongportConfig(
+                app_key=app_key,
+                app_secret=app_secret,
+                access_token=access_token,
+                http_url=cfg.longport_http_url or None,
+                quote_ws_url=cfg.longport_quote_ws_url or None,
+            )
+            ctx = TradeContext(lp_cfg)
+            resp = ctx.stock_positions()
+        except Exception as e:
+            return [], str(e)
+
+        rows: List[Dict[str, Any]] = []
+        for ch in getattr(resp, "channels", []) or []:
+            for p in getattr(ch, "positions", []) or []:
+                symbol = str(getattr(p, "symbol", "") or "").strip().upper()
+                if not symbol:
+                    continue
+                code, market = self._longport_symbol_to_internal(symbol)
+                if not code:
+                    continue
+                name = str(getattr(p, "symbol_name", "") or "").strip() or code
+                try:
+                    shares = float(getattr(p, "quantity", 0) or 0)
+                except Exception:
+                    shares = 0.0
+                try:
+                    avg_cost = float(getattr(p, "cost_price", 0) or 0)
+                except Exception:
+                    avg_cost = 0.0
+                rows.append({
+                    "code": code,
+                    "market": market,
+                    "name": name,
+                    "shares": shares,
+                    "avg_cost": avg_cost,
+                })
+        return rows, None
+
+    @staticmethod
+    def _longport_symbol_to_internal(symbol: str) -> Tuple[Optional[str], Optional[str]]:
+        s = (symbol or "").strip().upper()
+        if s.endswith(".US"):
+            return s[:-3], "US"
+        if s.endswith(".HK"):
+            raw = s[:-3]
+            if raw.isdigit():
+                return f"HK{raw.zfill(5)}", "HK"
+            return None, None
+        if s.endswith(".SH") or s.endswith(".SZ"):
+            raw = s[:-3]
+            if raw.isdigit() and len(raw) == 6:
+                return raw, "CN"
+            return None, None
+        return None, None
+
+    @staticmethod
+    def _build_sync_weight_map(rows: List[Dict[str, Any]], total_asset_cny: float) -> Dict[str, float]:
+        values = {r["code"]: max(0.0, float(r.get("value_cny") or 0.0)) for r in rows}
+        total_value = sum(values.values())
+        out: Dict[str, float] = {}
+        normalized = False
+
+        if total_asset_cny > 0:
+            raw_weights = {code: (val / total_asset_cny * 100.0 if total_asset_cny > 0 else 0.0) for code, val in values.items()}
+            raw_sum = sum(raw_weights.values())
+            max_w = max(raw_weights.values()) if raw_weights else 0.0
+            if raw_sum <= 100.0 + 1e-6 and max_w <= 100.0 + 1e-6:
+                out.update(raw_weights)
+            else:
+                normalized = True
+        else:
+            normalized = True
+
+        if normalized:
+            if total_value <= 0:
+                # 极端情况下等权
+                n = max(1, len(rows))
+                for r in rows:
+                    out[r["code"]] = 100.0 / n
+            else:
+                for code, val in values.items():
+                    out[code] = val / total_value * 100.0
+
+        out["_normalized_by_value"] = 1.0 if normalized else 0.0
+        return out
 
     @staticmethod
     def _infer_market_by_code(code: str) -> str:
@@ -845,6 +1069,24 @@ class PositionCommand(BotCommand):
             return False
         gap = (latest_date - prev_date).days
         return 1 <= gap <= 7
+
+    @classmethod
+    def _is_local_day_pnl_date_available(cls, latest_date: Optional[date], market: str) -> bool:
+        """
+        本地日线是否可用于“当日盈亏”。
+        - 工作日：仅当 latest_date == 市场今日，避免把“上一交易日涨跌”误当当日；
+        - 周末：允许回退到最近一个交易日（通常周五），便于周末复盘查看。
+        """
+        if latest_date is None:
+            return False
+        now = datetime.now(cls._market_tz(market))
+        market_today = now.date()
+        if latest_date == market_today:
+            return True
+        if market_today.weekday() >= 5:
+            gap = (market_today - latest_date).days
+            return 1 <= gap <= 2 and latest_date.weekday() < 5
+        return False
 
     @classmethod
     def _db_prev_close_candidate(cls, db, code: str, market: str) -> Optional[float]:
@@ -917,6 +1159,28 @@ class PositionCommand(BotCommand):
             return pre_close
 
         candidate = cls._db_prev_close_candidate(db, code, market)
+        is_open_now = cls._is_market_open_now(m)
+
+        # 非美股在开盘时优先信任实时昨收，避免本地日线滞后导致“当日涨跌幅”被压缩。
+        if is_open_now:
+            if pre_close is not None and pre_close > 0:
+                logger.info(
+                    f"[POS PNL] prev_close归一化 {symbol} -> 非美股开盘中使用实时昨收 "
+                    f"rt={pre_close} db={candidate} final={pre_close}"
+                )
+                return pre_close
+            if candidate is not None and candidate > 0:
+                logger.info(
+                    f"[POS PNL] prev_close归一化 {symbol} -> 非美股开盘中使用本地昨收(实时缺失) "
+                    f"rt={pre_close} db={candidate} final={candidate}"
+                )
+                return candidate
+            logger.info(
+                f"[POS PNL] prev_close归一化 {symbol} -> 非美股开盘中昨收缺失 "
+                f"rt={pre_close} db={candidate} final=None"
+            )
+            return None
+
         if candidate is None or candidate <= 0:
             logger.info(
                 f"[POS PNL] prev_close归一化 {symbol} -> 非美股使用实时昨收(本地缺失) "
@@ -977,24 +1241,21 @@ class PositionCommand(BotCommand):
             if not is_open_now:
                 cached = self._get_cached_daily_quote(code, market)
                 if cached:
-                    snap = dict(cached)
-                    snap["pre_close"] = self._normalize_prev_close(
-                        db=db,
-                        code=code,
-                        market=market,
-                        current_price=snap.get("price"),
-                        pre_close=snap.get("pre_close"),
-                    )
-                    if snap.get("price") is not None and snap.get("pre_close") is not None:
-                        snap["change_amount"] = float(snap["price"]) - float(snap["pre_close"])
-                    quotes[code] = snap
-                    continue
+                    # 闭市先使用缓存里的“价格/开盘”兜底；当日盈亏仍以下方本地日线
+                    # + 实时源重算，避免缓存中的旧 pre_close 导致日盈亏误算。
+                    current_price = cached.get("price")
+                    open_price = cached.get("open")
                 try:
                     latest = db.get_latest_data(code, days=2)
                     if latest and latest[0].close:
                         current_price = float(latest[0].close)
                         open_price = float(latest[0].open) if latest[0].open is not None else None
+                        latest_date = getattr(latest[0], "date", None)
+                        local_day_available = self._is_local_day_pnl_date_available(latest_date, market)
                         if (
+                            local_day_available
+                            and pre_close is None
+                            and
                             len(latest) > 1
                             and latest[1].close
                             and self._is_valid_prev_close_gap(
@@ -1004,8 +1265,12 @@ class PositionCommand(BotCommand):
                             )
                         ):
                             pre_close = float(latest[1].close)
-                        if pre_close is not None:
+                        if local_day_available and pre_close is not None:
                             change_amount = current_price - pre_close
+                        elif not local_day_available:
+                            # 本地最新日线不是“市场当天”，不计算当日盈亏，避免误把前一日涨跌当今日。
+                            pre_close = None
+                            change_amount = None
                     snapshot = {
                         "price": current_price,
                         "pre_close": pre_close,
@@ -1013,8 +1278,6 @@ class PositionCommand(BotCommand):
                         "change_amount": change_amount,
                     }
                     self._set_cached_daily_quote(code, market, snapshot)
-                    quotes[code] = snapshot
-                    continue
                 except Exception:
                     pass
 
@@ -1050,6 +1313,7 @@ class PositionCommand(BotCommand):
                         "pre_close": pre_close,
                         "open": open_price,
                         "change_amount": change_amount,
+                        "price_session": getattr(quote, "price_session", None),
                     }
                     continue
             except Exception:
@@ -1064,8 +1328,14 @@ class PositionCommand(BotCommand):
                             current_price = float(latest[0].close)
                         if open_price is None and latest[0].open is not None:
                             open_price = float(latest[0].open)
+                        latest_date = getattr(latest[0], "date", None)
+                        local_day_available = self._is_local_day_pnl_date_available(latest_date, market)
                         # 盘中且已拿到实时价时，不用本地旧日线补昨收，避免当日盈亏放大
-                        if pre_close is None and (not is_open_now or current_price is None):
+                        if (
+                            pre_close is None
+                            and (not is_open_now or current_price is None)
+                            and local_day_available
+                        ):
                             if (
                                 len(latest) > 1
                                 and latest[1].close
@@ -1097,8 +1367,20 @@ class PositionCommand(BotCommand):
                 "pre_close": pre_close,
                 "open": open_price,
                 "change_amount": change_amount,
+                "price_session": None,
             }
         return quotes
+
+    @staticmethod
+    def _price_session_text(raw: Optional[str]) -> str:
+        s = (raw or "").strip().lower()
+        mapping = {
+            "regular": "（常规）",
+            "pre": "（盘前）",
+            "post": "（盘后）",
+            "overnight": "（夜盘）",
+        }
+        return mapping.get(s, "")
 
     @staticmethod
     def _parse_set_payload(payload: List[str]) -> Dict[str, Any]:

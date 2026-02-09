@@ -43,11 +43,11 @@ class AnalyzeCommand(BotCommand):
     
     @property
     def description(self) -> str:
-        return "分析指定股票"
+        return "分析指定股票（支持持仓一键分析）"
     
     @property
     def usage(self) -> str:
-        return "/analyze <股票代码|股票名称> [CN|HK|US] [full] [-f|--force]"
+        return "/analyze <股票代码|股票名称|pos> [CN|HK|US] [full] [-f|--force]"
     
     def validate_args(self, args: List[str]) -> Optional[str]:
         """验证参数"""
@@ -84,6 +84,9 @@ class AnalyzeCommand(BotCommand):
         query = " ".join(tokens).strip()
         if not query:
             return BotResponse.error_response("请输入股票代码或名称")
+
+        if self._is_positions_query(query):
+            return self._analyze_positions(message, market=market, report_type=report_type, force_reanalyze=force_reanalyze)
 
         code, resolved_name, err = self._resolve_stock_code(query, market)
         if err:
@@ -191,6 +194,43 @@ class AnalyzeCommand(BotCommand):
         except Exception as e:
             logger.error(f"[AnalyzeCommand] 执行失败: {e}")
             return BotResponse.error_response(f"分析失败: {str(e)[:100]}")
+
+    @staticmethod
+    def _is_positions_query(query: str) -> bool:
+        q = (query or "").strip().lower()
+        return q in {"pos", "position", "positions", "portfolio", "持仓", "仓位", "我的持仓"}
+
+    @staticmethod
+    def _build_owner_key(message: BotMessage) -> str:
+        platform = (message.platform or "").strip().lower()
+        user_id = (message.user_id or "").strip()
+        if not platform or not user_id:
+            return ""
+        return f"{platform}:{user_id}".lower()
+
+    def _analyze_positions(
+        self,
+        message: BotMessage,
+        market: Optional[str],
+        report_type: str,
+        force_reanalyze: bool,
+    ) -> BotResponse:
+        try:
+            from bot.commands.batch import BatchCommand
+        except Exception as e:
+            logger.error(f"[AnalyzeCommand] 加载 BatchCommand 失败: {e}")
+            return BotResponse.error_response("持仓批量分析功能初始化失败")
+
+        # 复用 /batch holdings 流程：单条摘要 + 飞书卡片按钮查看单股详情
+        batch_args: List[str] = ["holdings"]
+        if market:
+            batch_args.append(market)
+        response = BatchCommand().execute(message, batch_args)
+        if force_reanalyze:
+            response.text = response.text + (
+                "\n\n已启用强制重跑模式：本次不复用当日历史。"
+            )
+        return response
 
     @staticmethod
     def _is_valid_code(code: str) -> bool:

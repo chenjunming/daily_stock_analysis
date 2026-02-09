@@ -730,6 +730,8 @@ class SearchService:
             serpapi_keys: SerpAPI Key 列表
         """
         self._providers: List[BaseSearchProvider] = []
+        self._longport_available_cache: Optional[bool] = None
+        self._longport_available_cache_ts: float = 0.0
         
         # 初始化搜索引擎（按优先级排序）
         # 1. Bocha 优先（中文搜索优化，AI摘要）
@@ -752,8 +754,35 @@ class SearchService:
     
     @property
     def is_available(self) -> bool:
-        """检查是否有可用的搜索引擎"""
-        return any(p.is_available for p in self._providers)
+        """检查情报搜索是否可用（搜索引擎或 Longport 快照）"""
+        if any(p.is_available for p in self._providers):
+            return True
+        return self._has_longport_available()
+
+    def _has_longport_available(self) -> bool:
+        """
+        检查 Longport 快照能力是否可用。
+        使用短时缓存，避免每次都重复初始化数据源管理器。
+        """
+        now = time.time()
+        if self._longport_available_cache is not None and (now - self._longport_available_cache_ts) < 30:
+            return self._longport_available_cache
+
+        available = False
+        try:
+            from data_provider import DataFetcherManager
+
+            manager = DataFetcherManager()
+            for fetcher in getattr(manager, "_fetchers", []):
+                if getattr(fetcher, "name", "") == "LongportFetcher" and hasattr(fetcher, "is_available"):
+                    available = bool(fetcher.is_available())
+                    break
+        except Exception:
+            available = False
+
+        self._longport_available_cache = available
+        self._longport_available_cache_ts = now
+        return available
     
     def search_stock_news(
         self,
@@ -918,9 +947,15 @@ class SearchService:
                 'desc': '行业分析'
             },
         ]
-        
+
         logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
-        
+
+        # 优先补充 Longport 快照（支持 CN/HK/US）
+        longport_snapshot = self._search_longport_snapshot(stock_code=stock_code, stock_name=stock_name)
+        if longport_snapshot and longport_snapshot.success and longport_snapshot.results:
+            results['longport_snapshot'] = longport_snapshot
+            logger.info("[情报搜索] Longport 快照已加入情报上下文")
+
         # 轮流使用不同的搜索引擎
         provider_index = 0
         
@@ -951,6 +986,99 @@ class SearchService:
             time.sleep(0.5)
         
         return results
+
+    def _search_longport_snapshot(self, stock_code: str, stock_name: str) -> SearchResponse:
+        """
+        使用 Longport 获取行情快照，作为情报补充维度。
+        """
+        code = (stock_code or "").strip().upper()
+        if not code:
+            return SearchResponse(
+                query="longport_snapshot",
+                results=[],
+                provider="Longport",
+                success=False,
+                error_message="股票代码为空",
+            )
+
+        try:
+            from data_provider import DataFetcherManager
+
+            manager = DataFetcherManager()
+            longport_fetcher = None
+            for fetcher in getattr(manager, "_fetchers", []):
+                if getattr(fetcher, "name", "") == "LongportFetcher" and hasattr(fetcher, "is_available"):
+                    if fetcher.is_available():
+                        longport_fetcher = fetcher
+                    break
+
+            if longport_fetcher is None:
+                return SearchResponse(
+                    query=f"{stock_name} {code} longport snapshot",
+                    results=[],
+                    provider="Longport",
+                    success=False,
+                    error_message="Longport 未启用",
+                )
+
+            quote = longport_fetcher.get_realtime_quote(code)
+            if quote is None or not quote.has_basic_data():
+                return SearchResponse(
+                    query=f"{stock_name} {code} longport snapshot",
+                    results=[],
+                    provider="Longport",
+                    success=False,
+                    error_message="Longport 实时行情为空",
+                )
+
+            # 近20日表现（可失败，不阻断）
+            perf_text = "近20日表现: 无数据"
+            try:
+                df = longport_fetcher.get_daily_data(code, days=20)
+                if df is not None and not df.empty and len(df) >= 2:
+                    first_close = float(df.iloc[0].get("close", 0) or 0)
+                    last_close = float(df.iloc[-1].get("close", 0) or 0)
+                    if first_close > 0:
+                        perf = (last_close - first_close) / first_close * 100
+                        perf_text = f"近20日表现: {perf:.2f}%"
+            except Exception:
+                pass
+
+            price = getattr(quote, "price", None)
+            change_pct = getattr(quote, "change_pct", None)
+            volume = getattr(quote, "volume", None)
+            amount = getattr(quote, "amount", None)
+            pre_close = getattr(quote, "pre_close", None)
+            high = getattr(quote, "high", None)
+            low = getattr(quote, "low", None)
+
+            title = f"{stock_name or code} Longport 行情快照"
+            snippet = (
+                f"最新价: {price}; 涨跌幅: {change_pct}; 昨收: {pre_close}; "
+                f"最高/最低: {high}/{low}; 成交量: {volume}; 成交额: {amount}; {perf_text}"
+            )
+            result = SearchResult(
+                title=title,
+                snippet=snippet,
+                url=f"longport://quote/{code}",
+                source="longport",
+                published_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            return SearchResponse(
+                query=f"{stock_name} {code} longport snapshot",
+                results=[result],
+                provider="Longport",
+                success=True,
+            )
+
+        except Exception as e:
+            return SearchResponse(
+                query=f"{stock_name} {code} longport snapshot",
+                results=[],
+                provider="Longport",
+                success=False,
+                error_message=str(e),
+            )
     
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
         """
@@ -972,7 +1100,7 @@ class SearchService:
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
-        display_order = ['latest_news', 'market_analysis', 'risk_check', 'earnings', 'industry']
+        display_order = ['longport_snapshot', 'latest_news', 'market_analysis', 'risk_check', 'earnings', 'industry']
         
         for dim_name in display_order:
             if dim_name not in intel_results:
@@ -982,6 +1110,7 @@ class SearchService:
             
             # 获取维度描述
             dim_desc = dim_name
+            if dim_name == 'longport_snapshot': dim_desc = '📡 长桥快照'
             if dim_name == 'latest_news': dim_desc = '📰 最新消息'
             elif dim_name == 'market_analysis': dim_desc = '📈 机构分析'
             elif dim_name == 'risk_check': dim_desc = '⚠️ 风险排查'

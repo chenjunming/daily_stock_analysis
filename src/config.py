@@ -46,6 +46,14 @@ class Config:
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
     tushare_http_url: Optional[str] = None
+    longport_app_key: Optional[str] = None
+    longport_app_secret: Optional[str] = None
+    longport_access_token: Optional[str] = None
+    longport_http_url: Optional[str] = None
+    longport_quote_ws_url: Optional[str] = None
+    longport_access_token_expires_at: Optional[str] = None
+    longport_auto_refresh: bool = True
+    longport_persist_access_token: bool = True
     
     # === AI 分析配置 ===
     gemini_api_key: Optional[str] = None
@@ -155,7 +163,8 @@ class Config:
     # 筹码分布开关（该接口不稳定，云端部署建议关闭）
     enable_chip_distribution: bool = True
     # 实时行情数据源优先级（逗号分隔）
-    # 推荐顺序：tencent > akshare_sina > efinance > akshare_em > tushare
+    # 推荐顺序：longport > tencent > akshare_sina > efinance > akshare_em > tushare
+    # - longport: Longbridge OpenAPI，港美股稳定（需配置凭证）
     # - tencent: 腾讯财经，有量比/换手率/市盈率等，单股查询稳定（推荐）
     # - akshare_sina: 新浪财经，基本行情稳定，但无量比
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
@@ -337,6 +346,14 @@ class Config:
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
             tushare_http_url=os.getenv('TUSHARE_HTTP_URL'),
+            longport_app_key=os.getenv('LONGPORT_APP_KEY'),
+            longport_app_secret=os.getenv('LONGPORT_APP_SECRET'),
+            longport_access_token=os.getenv('LONGPORT_ACCESS_TOKEN'),
+            longport_http_url=os.getenv('LONGPORT_HTTP_URL'),
+            longport_quote_ws_url=os.getenv('LONGPORT_QUOTE_WS_URL'),
+            longport_access_token_expires_at=os.getenv('LONGPORT_ACCESS_TOKEN_EXPIRES_AT'),
+            longport_auto_refresh=os.getenv('LONGPORT_AUTO_REFRESH', 'true').lower() == 'true',
+            longport_persist_access_token=os.getenv('LONGPORT_PERSIST_ACCESS_TOKEN', 'true').lower() == 'true',
             gemini_api_key=os.getenv('GEMINI_API_KEY'),
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-2.5-flash'),
@@ -432,6 +449,7 @@ class Config:
             enable_realtime_quote=os.getenv('ENABLE_REALTIME_QUOTE', 'true').lower() == 'true',
             enable_chip_distribution=os.getenv('ENABLE_CHIP_DISTRIBUTION', 'true').lower() == 'true',
             # 实时行情数据源优先级：
+            # - longport: Longbridge OpenAPI（港美股稳定，需配置 Token）
             # - tencent: 腾讯财经，有量比/换手率/PE/PB等，单股查询稳定（推荐）
             # - akshare_sina: 新浪财经，基本行情稳定，但无量比
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
@@ -492,6 +510,10 @@ class Config:
         
         if not self.tushare_token:
             warnings.append("提示：未配置 Tushare Token，将使用其他数据源")
+        has_any_longport = any([self.longport_app_key, self.longport_app_secret, self.longport_access_token])
+        has_all_longport = all([self.longport_app_key, self.longport_app_secret, self.longport_access_token])
+        if has_any_longport and not has_all_longport:
+            warnings.append("警告：Longport 凭证不完整（需同时配置 APP_KEY/APP_SECRET/ACCESS_TOKEN）")
         
         if not self.gemini_api_key and not self.openai_api_key:
             warnings.append("警告：未配置 Gemini 或 OpenAI API Key，AI 分析功能将不可用")

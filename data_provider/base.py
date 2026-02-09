@@ -54,6 +54,30 @@ class DataSourceUnavailableError(DataFetchError):
     pass
 
 
+def _is_us_code(stock_code: str) -> bool:
+    code = (stock_code or "").strip().upper()
+    if code.endswith(".US"):
+        code = code[:-3]
+    return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$', code))
+
+
+def _is_hk_code(stock_code: str) -> bool:
+    code = (stock_code or "").strip().upper()
+    if code.endswith(".HK"):
+        code = code[:-3]
+    if code.startswith("HK"):
+        code = code[2:]
+    return bool(re.match(r'^\d{1,5}$', code))
+
+
+def _detect_market(stock_code: str) -> str:
+    if _is_us_code(stock_code):
+        return "US"
+    if _is_hk_code(stock_code):
+        return "HK"
+    return "CN"
+
+
 class BaseFetcher(ABC):
     """
     数据源抽象基类
@@ -313,6 +337,7 @@ class DataFetcherManager:
           2. TushareFetcher (Priority 2)
           3. BaostockFetcher (Priority 3)
           4. YfinanceFetcher (Priority 4)
+          5. LongportFetcher (Priority -2/98，凭证配置后优先)
         """
         from .efinance_fetcher import EfinanceFetcher
         from .akshare_fetcher import AkshareFetcher
@@ -320,6 +345,7 @@ class DataFetcherManager:
         from .pytdx_fetcher import PytdxFetcher
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
+        from .longport_fetcher import LongportFetcher
         from src.config import get_config
 
         config = get_config()
@@ -331,6 +357,7 @@ class DataFetcherManager:
         pytdx = PytdxFetcher()      # 通达信数据源
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
+        longport = LongportFetcher()
 
         # 初始化数据源列表
         self._fetchers = [
@@ -340,6 +367,7 @@ class DataFetcherManager:
             pytdx,
             baostock,
             yfinance,
+            longport,
         ]
 
         # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
@@ -384,19 +412,29 @@ class DataFetcherManager:
         """
         errors = []
 
-        # 美股专用路由：仅使用 Yfinance/Akshare，且优先 Yfinance
-        is_us = bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', (stock_code or "").strip().upper()))
+        market = _detect_market(stock_code)
         fetchers_to_try = self._fetchers
-        if is_us:
+        if market in {"US", "HK"}:
             by_name = {f.name: f for f in self._fetchers}
-            fetchers_to_try = [
-                f for f in [
-                    by_name.get("YfinanceFetcher"),
-                    by_name.get("AkshareFetcher"),
-                ] if f is not None
-            ] or self._fetchers
+            if market == "US":
+                fetchers_to_try = [
+                    f for f in [
+                        by_name.get("LongportFetcher"),
+                        by_name.get("YfinanceFetcher"),
+                        by_name.get("AkshareFetcher"),
+                    ] if f is not None and (f.name != "LongportFetcher" or not hasattr(f, "is_available") or f.is_available())
+                ] or self._fetchers
+            else:
+                fetchers_to_try = [
+                    f for f in [
+                        by_name.get("LongportFetcher"),
+                        by_name.get("YfinanceFetcher"),
+                        by_name.get("AkshareFetcher"),
+                        by_name.get("EfinanceFetcher"),
+                    ] if f is not None and (f.name != "LongportFetcher" or not hasattr(f, "is_available") or f.is_available())
+                ] or self._fetchers
             logger.info(
-                f"[美股路由] {stock_code} 使用专用数据源链路: "
+                f"[{market}路由] {stock_code} 使用专用数据源链路: "
                 f"{' -> '.join(f.name for f in fetchers_to_try)}"
             )
 
@@ -509,12 +547,10 @@ class DataFetcherManager:
         获取实时行情数据（自动故障切换）
         
         故障切换策略（按配置的优先级）：
-        1. 美股：使用 YfinanceFetcher.get_realtime_quote()
-        2. EfinanceFetcher.get_realtime_quote()
-        3. AkshareFetcher.get_realtime_quote(source="em")  - 东财
-        4. AkshareFetcher.get_realtime_quote(source="sina") - 新浪
-        5. AkshareFetcher.get_realtime_quote(source="tencent") - 腾讯
-        6. 返回 None（降级兜底）
+        1. A/港/美股优先尝试 LongportFetcher.get_realtime_quote()
+        2. 美股回退 YfinanceFetcher.get_realtime_quote()
+        3. 其他按 REALTIME_SOURCE_PRIORITY 依次尝试
+        4. 返回 None（降级兜底）
         
         Args:
             stock_code: 股票代码
@@ -522,8 +558,6 @@ class DataFetcherManager:
         Returns:
             UnifiedRealtimeQuote 对象，所有数据源都失败则返回 None
         """
-        from .realtime_types import get_realtime_circuit_breaker
-        from .akshare_fetcher import _is_us_code
         from src.config import get_config
         
         config = get_config()
@@ -533,8 +567,24 @@ class DataFetcherManager:
             logger.debug(f"[实时行情] 功能已禁用，跳过 {stock_code}")
             return None
         
-        # 美股单独处理，使用 YfinanceFetcher
-        if _is_us_code(stock_code):
+        market = _detect_market(stock_code)
+
+        # 港美A股优先尝试 Longport
+        if market in {"US", "HK", "CN"}:
+            for fetcher in self._fetchers:
+                if fetcher.name == "LongportFetcher":
+                    if hasattr(fetcher, 'get_realtime_quote'):
+                        try:
+                            quote = fetcher.get_realtime_quote(stock_code)
+                            if quote is not None and quote.has_basic_data():
+                                logger.info(f"[实时行情] {market} {stock_code} 成功获取 (来源: longport)")
+                                return quote
+                        except Exception as e:
+                            logger.warning(f"[实时行情] {market} {stock_code} Longport 获取失败: {e}")
+                    break
+
+        # 美股 fallback：Yfinance
+        if market == "US":
             for fetcher in self._fetchers:
                 if fetcher.name == "YfinanceFetcher":
                     if hasattr(fetcher, 'get_realtime_quote'):
@@ -559,8 +609,16 @@ class DataFetcherManager:
             
             try:
                 quote = None
-                
-                if source == "efinance":
+
+                if source == "longport":
+                    # 尝试 LongportFetcher（港美股）
+                    for fetcher in self._fetchers:
+                        if fetcher.name == "LongportFetcher":
+                            if hasattr(fetcher, 'get_realtime_quote'):
+                                quote = fetcher.get_realtime_quote(stock_code)
+                            break
+
+                elif source == "efinance":
                     # 尝试 EfinanceFetcher
                     for fetcher in self._fetchers:
                         if fetcher.name == "EfinanceFetcher":

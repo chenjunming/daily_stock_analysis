@@ -866,7 +866,13 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         rt = context.get('realtime') if isinstance(context.get('realtime'), dict) else {}
         chip = context.get('chip') if isinstance(context.get('chip'), dict) else {}
         trend = context.get('trend_analysis') if isinstance(context.get('trend_analysis'), dict) else {}
-        rsi_val = today.get('rsi') or today.get('rsi12') or trend.get('rsi') or trend.get('rsi12')
+        rsi_val = (
+            today.get('rsi')
+            or today.get('rsi12')
+            or trend.get('rsi')
+            or trend.get('rsi12')
+            or trend.get('rsi_12')
+        )
         holding = context.get('user_holding') if isinstance(context.get('user_holding'), dict) else {}
         portfolio = context.get('portfolio_profile') if isinstance(context.get('portfolio_profile'), dict) else {}
         market_dist = portfolio.get('market_distribution', {}) if isinstance(portfolio, dict) else {}
@@ -890,9 +896,13 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
         if rt:
             lines.extend([
                 "【实时增强】",
-                f"- rt_price={rt.get('price')} volume_ratio={rt.get('volume_ratio')} turnover_rate={rt.get('turnover_rate')}",
-                f"- pe={rt.get('pe_ratio')} pb={rt.get('pb_ratio')} mv={self._format_amount(rt.get('total_mv'))}",
-                f"- change_60d={rt.get('change_60d')}",
+                f"- rt_price={rt.get('price')} pre_close={rt.get('pre_close')} change_pct={rt.get('change_pct')} change_amount={rt.get('change_amount')}",
+                f"- rt_ohlc: open={rt.get('open_price')} high={rt.get('high')} low={rt.get('low')}",
+                f"- volume_ratio={rt.get('volume_ratio')} turnover_rate={rt.get('turnover_rate')} amplitude={rt.get('amplitude')}",
+                f"- volume={self._format_volume(rt.get('volume'))} amount={self._format_amount(rt.get('amount'))}",
+                f"- pe={rt.get('pe_ratio')} pb={rt.get('pb_ratio')} total_mv={self._format_amount(rt.get('total_mv'))} circ_mv={self._format_amount(rt.get('circ_mv'))}",
+                f"- change_60d={rt.get('change_60d')} high_52w={rt.get('high_52w')} low_52w={rt.get('low_52w')}",
+                f"- session: trade_session={rt.get('trade_session')} price_session={rt.get('price_session')} price_ts={rt.get('price_timestamp')} source={rt.get('source')}",
             ])
 
         if chip:
@@ -922,7 +932,13 @@ strategy_execution.execution_plan 强制字段（必须给出明确仓位比例�
             lines.extend([
                 "【趋势】",
                 f"- trend_status={trend.get('trend_status')} ma_alignment={trend.get('ma_alignment')} trend_strength={trend.get('trend_strength')}",
-                f"- bias_ma5={trend.get('bias_ma5')} bias_ma10={trend.get('bias_ma10')} volume_status={trend.get('volume_status')}",
+                f"- trend_ma: current_price={trend.get('current_price')} ma5={trend.get('ma5')} ma10={trend.get('ma10')} ma20={trend.get('ma20')} ma60={trend.get('ma60')}",
+                f"- bias_ma5={trend.get('bias_ma5')} bias_ma10={trend.get('bias_ma10')} bias_ma20={trend.get('bias_ma20')}",
+                f"- volume_status={trend.get('volume_status')} volume_ratio_5d={trend.get('volume_ratio_5d')} volume_trend={trend.get('volume_trend')}",
+                f"- support_ma5={trend.get('support_ma5')} support_ma10={trend.get('support_ma10')}",
+                f"- support_levels={trend.get('support_levels')} resistance_levels={trend.get('resistance_levels')}",
+                f"- macd: dif={trend.get('macd_dif')} dea={trend.get('macd_dea')} bar={trend.get('macd_bar')} status={trend.get('macd_status')} signal={trend.get('macd_signal')}",
+                f"- rsi: rsi6={trend.get('rsi_6')} rsi12={trend.get('rsi_12')} rsi24={trend.get('rsi_24')} status={trend.get('rsi_status')} signal={trend.get('rsi_signal')}",
                 f"- buy_signal={trend.get('buy_signal')} signal_score={trend.get('signal_score')}",
                 f"- signal_reasons={self._truncate_text('; '.join(signal_reasons), 220)}",
                 f"- risk_factors={self._truncate_text('; '.join(risk_factors), 220)}",

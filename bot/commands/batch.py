@@ -35,6 +35,7 @@ class BatchCommand(BotCommand):
         /batch HK   - 只分析港股
         /batch US 5 - 只分析前5只美股
         /batch holdings US - 按持仓分析美股
+        /batch holdings US -f - 强制重跑（不复用当日历史）
     """
     
     @property
@@ -51,7 +52,7 @@ class BatchCommand(BotCommand):
     
     @property
     def usage(self) -> str:
-        return "/batch [holdings|position] [CN|HK|US|A股|港股|美股] [数量]"
+        return "/batch [holdings|position] [CN|HK|US|A股|港股|美股] [数量] [-f|--force]"
     
     @property
     def admin_only(self) -> bool:
@@ -66,7 +67,7 @@ class BatchCommand(BotCommand):
         config = get_config()
         db = get_db()
 
-        source, market, limit, parse_error = self._parse_source_market_and_limit(args)
+        source, market, limit, force_reanalyze, parse_error = self._parse_source_market_and_limit(args)
         if parse_error:
             return BotResponse.error_response(parse_error)
 
@@ -122,7 +123,7 @@ class BatchCommand(BotCommand):
         # 在后台线程中执行分析
         thread = threading.Thread(
             target=self._run_batch_analysis,
-            args=(stock_list, code_name_map, message, market),
+            args=(stock_list, code_name_map, message, market, force_reanalyze),
             daemon=True
         )
         thread.start()
@@ -137,6 +138,7 @@ class BatchCommand(BotCommand):
             f"✅ **批量分析任务已启动**\n\n"
             f"• 范围: {market_desc}{source_desc}\n"
             f"• 分析数量: {len(stock_list)} 只\n"
+            f"• 模式: {'强制重跑' if force_reanalyze else '智能复用'}\n"
             f"• 股票列表: {', '.join(preview)}"
             f"{'...' if len(stock_list) > 5 else ''}\n\n"
             f"分析完成后将自动推送汇总报告。"
@@ -147,7 +149,8 @@ class BatchCommand(BotCommand):
         stock_list: List[str],
         code_name_map: Dict[str, str],
         message: BotMessage,
-        market: Optional[str] = None
+        market: Optional[str] = None,
+        force_reanalyze: bool = False,
     ) -> None:
         """后台执行批量分析"""
         try:
@@ -257,32 +260,33 @@ class BatchCommand(BotCommand):
             results = []
             for code in stock_list:
                 try:
-                    cached_result = self._load_today_analysis_result(code)
-                    if cached_result:
-                        results.append(cached_result)
-                        if batch_status[code].get("_counted") is not True:
-                            batch_status[code]["_counted"] = True
-                            batch_status[code]["status"] = "cached"
-                            batch_status[code]["detail"] = f"{code} 今日已分析，复用历史结果"
-                            current_code = code
-                            done += 1
-                            success += 1
-                            if stream_session:
-                                content = self._render_batch_progress_card(
-                                    batch_id="batch",
-                                    stock_list=stock_list,
-                                    code_name_map=code_name_map,
-                                    batch_status=batch_status,
-                                    done=done,
-                                    success=success,
-                                    failed=failed,
-                                    current_code=current_code,
-                                    started_at=started_at,
-                                    version=stream_session.version + 1,
-                                    market=market,
-                                )
-                                stream_session.update(content, force=True)
-                        continue
+                    if not force_reanalyze:
+                        cached_result = self._load_today_analysis_result(code)
+                        if cached_result:
+                            results.append(cached_result)
+                            if batch_status[code].get("_counted") is not True:
+                                batch_status[code]["_counted"] = True
+                                batch_status[code]["status"] = "cached"
+                                batch_status[code]["detail"] = f"{code} 今日已分析，复用历史结果"
+                                current_code = code
+                                done += 1
+                                success += 1
+                                if stream_session:
+                                    content = self._render_batch_progress_card(
+                                        batch_id="batch",
+                                        stock_list=stock_list,
+                                        code_name_map=code_name_map,
+                                        batch_status=batch_status,
+                                        done=done,
+                                        success=success,
+                                        failed=failed,
+                                        current_code=current_code,
+                                        started_at=started_at,
+                                        version=stream_session.version + 1,
+                                        market=market,
+                                    )
+                                    stream_session.update(content, force=True)
+                            continue
 
                     result = pipeline.process_single_stock(
                         code=code,
@@ -572,10 +576,13 @@ class BatchCommand(BotCommand):
         }
 
     @staticmethod
-    def _parse_source_market_and_limit(args: List[str]) -> tuple[str, Optional[str], Optional[int], Optional[str]]:
+    def _parse_source_market_and_limit(
+        args: List[str],
+    ) -> tuple[str, Optional[str], Optional[int], bool, Optional[str]]:
         source = "watchlist"
         market = None
         limit = None
+        force_reanalyze = False
         source_map = {
             "HOLDING": "holdings",
             "HOLDINGS": "holdings",
@@ -592,6 +599,9 @@ class BatchCommand(BotCommand):
             token = (raw or "").strip()
             if not token:
                 continue
+            if token.lower() in {"-f", "--force", "force", "reanalyze", "重跑", "重新"}:
+                force_reanalyze = True
+                continue
             src = source_map.get(token.upper(), source_map.get(token))
             if src:
                 source = src
@@ -599,19 +609,19 @@ class BatchCommand(BotCommand):
             m = market_map.get(token.upper(), market_map.get(token))
             if m:
                 if market and market != m:
-                    return source, None, None, f"市场参数冲突: {market} 与 {m}"
+                    return source, None, None, False, f"市场参数冲突: {market} 与 {m}"
                 market = m
                 continue
             try:
                 value = int(token)
                 if value <= 0:
-                    return source, None, None, "数量必须大于0"
+                    return source, None, None, False, "数量必须大于0"
                 if limit is not None:
-                    return source, None, None, f"重复数量参数: {token}"
+                    return source, None, None, False, f"重复数量参数: {token}"
                 limit = value
             except ValueError:
-                return source, None, None, f"无效参数: {token}（应为数据源/市场/数量）"
-        return source, market, limit, None
+                return source, None, None, False, f"无效参数: {token}（应为数据源/市场/数量/force）"
+        return source, market, limit, force_reanalyze, None
 
     @staticmethod
     def _build_owner_key(message: BotMessage) -> str:

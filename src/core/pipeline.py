@@ -394,14 +394,28 @@ class StockAnalysisPipeline:
             enhanced['realtime'] = {
                 'name': getattr(realtime_quote, 'name', ''),
                 'price': getattr(realtime_quote, 'price', None),
+                'change_pct': getattr(realtime_quote, 'change_pct', None),
+                'change_amount': getattr(realtime_quote, 'change_amount', None),
                 'volume_ratio': volume_ratio,
                 'volume_ratio_desc': self._describe_volume_ratio(volume_ratio) if volume_ratio else '无数据',
+                'volume': getattr(realtime_quote, 'volume', None),
+                'amount': getattr(realtime_quote, 'amount', None),
                 'turnover_rate': getattr(realtime_quote, 'turnover_rate', None),
+                'amplitude': getattr(realtime_quote, 'amplitude', None),
+                'open_price': getattr(realtime_quote, 'open_price', None),
+                'high': getattr(realtime_quote, 'high', None),
+                'low': getattr(realtime_quote, 'low', None),
+                'pre_close': getattr(realtime_quote, 'pre_close', None),
                 'pe_ratio': getattr(realtime_quote, 'pe_ratio', None),
                 'pb_ratio': getattr(realtime_quote, 'pb_ratio', None),
                 'total_mv': getattr(realtime_quote, 'total_mv', None),
                 'circ_mv': getattr(realtime_quote, 'circ_mv', None),
                 'change_60d': getattr(realtime_quote, 'change_60d', None),
+                'high_52w': getattr(realtime_quote, 'high_52w', None),
+                'low_52w': getattr(realtime_quote, 'low_52w', None),
+                'trade_session': getattr(realtime_quote, 'trade_session', None),
+                'price_session': getattr(realtime_quote, 'price_session', None),
+                'price_timestamp': getattr(realtime_quote, 'price_timestamp', None),
                 'source': getattr(realtime_quote, 'source', None),
             }
             # 移除 None 值以减少上下文大小
@@ -420,19 +434,7 @@ class StockAnalysisPipeline:
         
         # 添加趋势分析结果
         if trend_result:
-            enhanced['trend_analysis'] = {
-                'trend_status': trend_result.trend_status.value,
-                'ma_alignment': trend_result.ma_alignment,
-                'trend_strength': trend_result.trend_strength,
-                'bias_ma5': trend_result.bias_ma5,
-                'bias_ma10': trend_result.bias_ma10,
-                'volume_status': trend_result.volume_status.value,
-                'volume_trend': trend_result.volume_trend,
-                'buy_signal': trend_result.buy_signal.value,
-                'signal_score': trend_result.signal_score,
-                'signal_reasons': trend_result.signal_reasons,
-                'risk_factors': trend_result.risk_factors,
-            }
+            enhanced['trend_analysis'] = trend_result.to_dict()
 
         # 添加用户持仓上下文（按用户隔离）
         if user_holding:

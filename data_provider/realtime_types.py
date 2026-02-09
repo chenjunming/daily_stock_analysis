@@ -92,6 +92,7 @@ def safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
 
 class RealtimeSource(Enum):
     """实时行情数据源"""
+    LONGPORT = "longport"           # Longbridge OpenAPI
     EFINANCE = "efinance"           # 东方财富（efinance库）
     AKSHARE_EM = "akshare_em"       # 东方财富（akshare库）
     AKSHARE_SINA = "akshare_sina"   # 新浪财经
@@ -144,6 +145,9 @@ class UnifiedRealtimeQuote:
     change_60d: Optional[float] = None      # 60日涨跌幅(%)
     high_52w: Optional[float] = None        # 52周最高
     low_52w: Optional[float] = None         # 52周最低
+    trade_session: Optional[str] = None     # 交易时段（raw）
+    price_session: Optional[str] = None     # 价格来源时段（regular/pre/post/overnight）
+    price_timestamp: Optional[str] = None   # 价格时间戳（ISO）
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（过滤 None 值）"""
@@ -158,7 +162,8 @@ class UnifiedRealtimeQuote:
             'volume_ratio', 'turnover_rate', 'amplitude',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
-            'change_60d', 'high_52w', 'low_52w'
+            'change_60d', 'high_52w', 'low_52w',
+            'trade_session', 'price_session', 'price_timestamp'
         ]
         for f in optional_fields:
             val = getattr(self, f, None)

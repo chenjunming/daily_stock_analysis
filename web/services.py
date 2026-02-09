@@ -813,7 +813,136 @@ class StockSearchService:
             dedup[key] = item
 
         ranked = self._rank_and_filter(list(dedup.values()), kw)
+        if len(ranked) < min(5, limit):
+            online_hits = self._search_online_multi_source(keyword=kw, market=market)
+            if online_hits:
+                with self._catalog_lock:
+                    for hit in online_hits:
+                        mkt = (hit.get("market") or "").upper()
+                        code = (hit.get("code") or "").upper()
+                        name = (hit.get("name") or code).strip() or code
+                        if mkt not in {"CN", "HK", "US"} or not code:
+                            continue
+                        exists = any(
+                            (x.get("code") or "").upper() == code
+                            for x in self._catalog.setdefault(mkt, [])
+                        )
+                        if not exists:
+                            self._catalog[mkt].append({"code": code, "name": name, "market": mkt})
+                            dedup[(mkt, code)] = {"code": code, "name": name, "market": mkt}
+                ranked = self._rank_and_filter(list(dedup.values()), kw)
         return {"success": True, "data": ranked[:limit]}
+
+    def _search_online_multi_source(self, keyword: str, market: Optional[str]) -> List[Dict[str, str]]:
+        """
+        在线多源兜底搜索（仅在本地候选不足时触发）。
+
+        执行顺序：
+        1) 先走 DataFetcherManager 统一实时行情链路（遵循实时优先级配置）
+        2) 若仍未命中，再按 fetcher.priority 逐个尝试 akshare/tushare/yfinance
+        """
+        kw = (keyword or "").strip().upper()
+        if not kw:
+            return []
+
+        target_market = (market or "").strip().upper()
+        if target_market not in {"CN", "HK", "US"}:
+            target_market = self._infer_market(kw)
+
+        # 非代码关键词（如“苹果”）不走在线精确兜底，避免高成本低命中
+        is_code_like = bool(
+            re.match(r"^\d{6}$", kw)
+            or re.match(r"^\d{5}$", kw)
+            or re.match(r"^HK\d{5}$", kw)
+            or re.match(r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$", kw)
+        )
+        if not is_code_like:
+            return []
+
+        candidates: List[str] = [kw]
+        if target_market == "HK":
+            if re.match(r"^\d{5}$", kw):
+                candidates = [f"HK{kw}", kw]
+            elif re.match(r"^HK\d{5}$", kw):
+                candidates = [kw, kw[2:]]
+        elif target_market == "CN" and re.match(r"^\d{6}$", kw):
+            candidates = [kw]
+        elif target_market == "US":
+            candidates = [kw]
+
+        try:
+            manager = DataFetcherManager()
+        except Exception as e:
+            logger.debug(f"[StockSearch] 初始化 DataFetcherManager 失败: {e}")
+            return []
+
+        hits: List[Dict[str, str]] = []
+
+        def _append_hit(quote_obj: Any, fallback_code: str) -> bool:
+            quote_name = str(getattr(quote_obj, "name", "") or "").strip()
+            quote_code = str(getattr(quote_obj, "code", "") or fallback_code).strip().upper()
+            if not quote_code:
+                return False
+            if not quote_name or quote_name.upper() == quote_code:
+                return False
+            hits.append({
+                "code": quote_code,
+                "name": quote_name,
+                "market": target_market,
+            })
+            return True
+
+        # 层 1：统一实时行情链路
+        for code in candidates[:2]:
+            try:
+                quote = manager.get_realtime_quote(code)
+                if quote and _append_hit(quote, code):
+                    break
+            except Exception as e:
+                logger.debug(f"[StockSearch] 在线兜底失败 code={code}, market={target_market}: {e}")
+
+        if hits:
+            return hits
+
+        # 层 2：按优先级逐个调用 fetcher（akshare/tushare/yfinance）
+        try:
+            fetchers = sorted(getattr(manager, "_fetchers", []), key=lambda f: getattr(f, "priority", 99))
+        except Exception:
+            fetchers = []
+
+        for code in candidates[:2]:
+            for fetcher in fetchers:
+                fname = str(getattr(fetcher, "name", "") or "")
+                if fname not in {"AkshareFetcher", "TushareFetcher", "YfinanceFetcher"}:
+                    continue
+                if target_market == "US" and fname not in {"YfinanceFetcher", "AkshareFetcher"}:
+                    continue
+                if target_market in {"CN", "HK"} and fname == "YfinanceFetcher":
+                    continue
+
+                try:
+                    # 1) 优先使用 stock_name 接口（轻量）
+                    if hasattr(fetcher, "get_stock_name"):
+                        name = str(fetcher.get_stock_name(code) or "").strip()
+                        if name and name.upper() != code.upper():
+                            hits.append({"code": code.upper(), "name": name, "market": target_market})
+                            return hits
+                except Exception:
+                    pass
+
+                try:
+                    # 2) 退化为实时行情接口
+                    quote = None
+                    if fname == "AkshareFetcher" and hasattr(fetcher, "get_realtime_quote"):
+                        quote = fetcher.get_realtime_quote(code, source="em")
+                    elif hasattr(fetcher, "get_realtime_quote"):
+                        quote = fetcher.get_realtime_quote(code)
+                    if quote and _append_hit(quote, code):
+                        return hits
+                except Exception:
+                    pass
+
+        return hits
 
     def _ensure_market_loaded(self, market: str) -> None:
         market = market.upper()

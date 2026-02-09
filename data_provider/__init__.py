@@ -17,6 +17,7 @@
 4. PytdxFetcher (Priority 2) - 来自 pytdx 库（通达信）
 5. BaostockFetcher (Priority 3) - 来自 baostock 库
 6. YfinanceFetcher (Priority 4) - 来自 yfinance 库
+7. LongportFetcher (Priority -2/98) - 来自 longport 库（港美股，按凭证动态启用）
 
 【未配置 TUSHARE_TOKEN 时】
 1. EfinanceFetcher (Priority 0) - 最高优先级，来自 efinance 库
@@ -36,6 +37,7 @@ from .tushare_fetcher import TushareFetcher
 from .pytdx_fetcher import PytdxFetcher
 from .baostock_fetcher import BaostockFetcher
 from .yfinance_fetcher import YfinanceFetcher
+from .longport_fetcher import LongportFetcher
 
 __all__ = [
     'BaseFetcher',
@@ -46,4 +48,5 @@ __all__ = [
     'PytdxFetcher',
     'BaostockFetcher',
     'YfinanceFetcher',
+    'LongportFetcher',
 ]
