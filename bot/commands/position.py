@@ -711,9 +711,8 @@ class PositionCommand(BotCommand):
             change_amount = q.get("change_amount")
             pnl_pct = None
             avg_cost = float(row.avg_cost or 0.0)
-            avg_cost_abs = abs(avg_cost)
-            if price and avg_cost_abs > 0:
-                pnl_pct = (float(price) - avg_cost_abs) / avg_cost_abs * 100.0
+            if price and avg_cost != 0:
+                pnl_pct = (float(price) - avg_cost) / avg_cost * 100.0
             shares = float(getattr(row, "shares", 0) or 0.0)
             day_pnl = None
             if shares > 0:
@@ -746,7 +745,7 @@ class PositionCommand(BotCommand):
                 "change_amount": change_amount,
                 "pnl_pct": pnl_pct,
                 "day_pnl": day_pnl,
-                "price_session": q.get("price_session"),
+                "price_session": self._resolve_display_session((row.market or "CN").upper(), q.get("price_session")),
             })
             total_weight += float(row.weight_pct or 0.0)
 
@@ -773,10 +772,9 @@ class PositionCommand(BotCommand):
                     elif item.get("current_price") is not None:
                         day_change_pct = (float(item["current_price"]) - float(pre_close)) / float(pre_close) * 100.0
                 day_change_text = "N/A" if day_change_pct is None else f"{day_change_pct:+.2f}%"
-                symbol = f"{item['name']} (`{item['code']}`)"
                 session_tag = self._price_session_text(item.get("price_session"))
-                price_with_session = f"{price_text}{session_tag}" if price_text != "N/A" else price_text
-                cost_price = f"{float(item['avg_cost'] or 0.0):.4f} / {price_with_session}"
+                symbol = f"{item['name']} (`{item['code']}`){(' ' + session_tag) if session_tag else ''}"
+                cost_price = f"{float(item['avg_cost'] or 0.0):.4f} / {price_text}"
                 pnl_mix = f"{pnl_text} / {day_change_text} / {day_pnl_text}"
                 lines.append(
                     f"| {symbol} | {cost_price} | {item['shares']:.4f} | "
@@ -835,14 +833,15 @@ class PositionCommand(BotCommand):
             avg_cost = float(p["avg_cost"] or 0.0)
             if shares <= 0:
                 continue
-            if avg_cost <= 0:
+            if avg_cost == 0:
                 # 长桥返回成本缺失时，回退现价作为占位成本，避免写入失败
                 avg_cost = float((quotes.get(code) or {}).get("price") or 0.0)
-            if avg_cost <= 0:
+            if avg_cost == 0:
                 continue
 
             price = float((quotes.get(code) or {}).get("price") or 0.0)
-            ref_price = price if price > 0 else avg_cost
+            # 仅用于仓位估算的参考价格应为正值；成本本身保留原始符号。
+            ref_price = price if price > 0 else abs(avg_cost)
             fx = 1.0
             if market == "US":
                 fx = usd_cny
@@ -1105,6 +1104,12 @@ class PositionCommand(BotCommand):
             # 本地日线过旧时不参与昨收校准，避免把多日变动误算成当日盈亏
             if latest_date is None or (market_today - latest_date).days > 7:
                 return None
+            # 仅在“本地日期可用于当日盈亏”时参与昨收校准：
+            # - 工作日必须是市场当日
+            # - 周末允许最近一个交易日（通常周五）
+            # 这样可规避本地数据写入日期异常（如周末日期）导致的昨收误覆盖。
+            if not cls._is_local_day_pnl_date_available(latest_date, market):
+                return None
             if latest_date == market_today and len(rows) > 1 and rows[1].close:
                 return float(rows[1].close)
             if rows[0].close:
@@ -1221,6 +1226,41 @@ class PositionCommand(BotCommand):
         with cls._daily_quote_cache_lock:
             cls._daily_quote_cache[key] = quote
 
+    @staticmethod
+    def _derive_prev_close_from_quote(
+        current_price: Optional[float],
+        change_amount: Optional[float],
+        change_pct: Optional[float],
+    ) -> Optional[float]:
+        """
+        根据实时行情字段反推昨收，兼容部分数据源 pre_close 偶发异常。
+        优先使用涨跌幅反推：pre_close = price / (1 + change_pct / 100)。
+        """
+        if current_price is None or current_price <= 0:
+            return None
+
+        # 优先使用涨跌幅（部分源在闭市时该字段更稳定）
+        if change_pct is not None:
+            try:
+                den = 1.0 + float(change_pct) / 100.0
+                if den > 0:
+                    candidate = float(current_price) / den
+                    if candidate > 0:
+                        return candidate
+            except Exception:
+                pass
+
+        # 回退到涨跌额
+        if change_amount is not None:
+            try:
+                candidate = float(current_price) - float(change_amount)
+                if candidate > 0:
+                    return candidate
+            except Exception:
+                pass
+
+        return None
+
     def _fetch_quote_snapshots(
         self,
         codes: List[str],
@@ -1288,6 +1328,7 @@ class PositionCommand(BotCommand):
                     pc = getattr(quote, "pre_close", None)
                     op = getattr(quote, "open_price", None)
                     ca = getattr(quote, "change_amount", None)
+                    cp = getattr(quote, "change_pct", None)
                     if p is not None and p > 0:
                         current_price = float(p)
                     if pc is not None and pc > 0:
@@ -1296,6 +1337,22 @@ class PositionCommand(BotCommand):
                         open_price = float(op)
                     if ca is not None:
                         change_amount = float(ca)
+                    derived_pre_close = self._derive_prev_close_from_quote(
+                        current_price=current_price,
+                        change_amount=change_amount,
+                        change_pct=float(cp) if cp is not None else None,
+                    )
+                    if derived_pre_close is not None:
+                        if pre_close is None or pre_close <= 0:
+                            pre_close = derived_pre_close
+                        else:
+                            diff_ratio = abs(float(pre_close) - derived_pre_close) / derived_pre_close
+                            if diff_ratio > 0.01:
+                                logger.info(
+                                    f"[POS PNL] prev_close校准 {(market or '').upper()}:{(code or '').upper()} -> "
+                                    f"使用反推昨收 rt_pre_close={pre_close} derived={derived_pre_close}"
+                                )
+                                pre_close = derived_pre_close
                     pre_close = self._normalize_prev_close(
                         db=db,
                         code=code,
@@ -1375,12 +1432,40 @@ class PositionCommand(BotCommand):
     def _price_session_text(raw: Optional[str]) -> str:
         s = (raw or "").strip().lower()
         mapping = {
-            "regular": "（常规）",
-            "pre": "（盘前）",
-            "post": "（盘后）",
-            "overnight": "（夜盘）",
+            "regular": "[常规]",
+            "pre": "[盘前]",
+            "post": "[盘后]",
+            "overnight": "[夜盘]",
         }
         return mapping.get(s, "")
+
+    @classmethod
+    def _resolve_display_session(cls, market: str, raw: Optional[str]) -> Optional[str]:
+        """
+        价格会话兜底：
+        - 优先使用数据源返回的 price_session；
+        - 美股若缺失则按纽约时间推断（盘前/常规/盘后/夜盘）。
+        """
+        normalized = (raw or "").strip().lower()
+        if normalized in {"regular", "pre", "post", "overnight"}:
+            return normalized
+
+        m = (market or "").upper()
+        if m != "US":
+            return normalized or None
+
+        now = datetime.now(cls._market_tz("US"))
+        if now.weekday() >= 5:
+            return normalized or None
+
+        t = now.time()
+        if dt_time(4, 0) <= t < dt_time(9, 30):
+            return "pre"
+        if dt_time(9, 30) <= t <= dt_time(16, 0):
+            return "regular"
+        if dt_time(16, 0) < t <= dt_time(20, 0):
+            return "post"
+        return "overnight"
 
     @staticmethod
     def _parse_set_payload(payload: List[str]) -> Dict[str, Any]:

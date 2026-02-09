@@ -197,6 +197,7 @@ class MarketAnalyzer:
             "pct_vs_ma50": None,
             "volume_ratio": None,
             "rsi12": None,
+            "price_session": None,
         }
         try:
             df, _ = self.data_manager.get_daily_data(code, days=100)
@@ -228,12 +229,48 @@ class MarketAnalyzer:
             if close and ma50:
                 out["pct_vs_ma50"] = (close - ma50) / ma50 * 100
 
+            # 叠加实时行情（尤其美股盘前/盘后会话），避免模板只展示前一交易日收盘价
+            quote = self.data_manager.get_realtime_quote(code)
+            if quote is not None:
+                rt_price = self._to_float(getattr(quote, "price", None))
+                rt_pre_close = self._to_float(getattr(quote, "pre_close", None))
+                rt_change_pct = self._to_float(getattr(quote, "change_pct", None))
+                if rt_change_pct is None and rt_price is not None and rt_pre_close and rt_pre_close > 0:
+                    rt_change_pct = (rt_price - rt_pre_close) / rt_pre_close * 100
+
+                if rt_price is not None:
+                    out["current"] = rt_price
+                if rt_change_pct is not None:
+                    out["pct_chg"] = rt_change_pct
+                out["price_session"] = getattr(quote, "price_session", None)
+
+                # 实时价格覆盖后，重算相对均线位置
+                current_val = self._to_float(out.get("current"))
+                if current_val is not None and ma20:
+                    out["pct_vs_ma20"] = (current_val - ma20) / ma20 * 100
+                if current_val is not None and ma50:
+                    out["pct_vs_ma50"] = (current_val - ma50) / ma50 * 100
+
+                rt_name = (getattr(quote, "name", "") or "").strip()
+                if rt_name:
+                    out["name"] = rt_name
+
             stock_name = self.data_manager.get_stock_name(code)
             if stock_name:
                 out["name"] = stock_name
         except Exception as e:
             logger.debug(f"[大盘] 获取 {code} 信号快照失败: {e}")
         return out
+
+    @staticmethod
+    def _price_session_suffix(raw: Optional[str]) -> str:
+        mapping = {
+            "pre": "(盘前)",
+            "post": "(盘后)",
+            "overnight": "(夜盘)",
+            "regular": "",
+        }
+        return mapping.get((raw or "").strip().lower(), "")
 
     def _get_recent_72h_points(self, code: str, limit: int = 2) -> str:
         """
@@ -729,6 +766,7 @@ class MarketAnalyzer:
                     "current": current,
                     "pnl_pct": pnl,
                     "day_change_pct": self._to_float(snap.get("pct_chg")),
+                    "price_session": snap.get("price_session"),
                     "action": action,
                     "trigger": trigger,
                     "volume_ratio": vol,
@@ -959,8 +997,11 @@ class MarketAnalyzer:
             lines.append("| - | - | - | 无持仓数据 | 使用 `/position set 代码 成本 仓位%` 后可显示个性化建议 |")
         else:
             for r in hold_rows[:20]:
+                current_text = (
+                    f"{self._fmt_num(r.get('current'))}{self._price_session_suffix(r.get('price_session'))}"
+                )
                 price_info = (
-                    f"{self._fmt_num(r.get('avg_cost'))} / {self._fmt_num(r.get('current'))} / "
+                    f"{self._fmt_num(r.get('avg_cost'))} / {current_text} / "
                     f"{self._fmt_pct(r.get('pnl_pct'))} / {self._fmt_pct(r.get('day_change_pct'))}"
                 )
                 lines.append(

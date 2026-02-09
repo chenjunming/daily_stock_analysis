@@ -113,8 +113,24 @@
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) 搜索 API（新闻搜索） | 推荐 |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) 全渠道搜索 | 可选 |
 | `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索优化，支持AI摘要，多个key用逗号分隔） | 可选 |
+| `LONGPORT_APP_KEY` | Longbridge OpenAPI App Key（港美股/实时增强） | 可选 |
+| `LONGPORT_APP_SECRET` | Longbridge OpenAPI App Secret | 可选 |
+| `LONGPORT_ACCESS_TOKEN` | Longbridge OpenAPI Access Token | 可选 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
+| `REALTIME_SOURCE_PRIORITY` | 实时行情优先级（默认 `longport,tencent,akshare_sina,efinance,akshare_em,tushare`） | 可选 |
 | `WECHAT_MSG_TYPE` | 企微消息类型，默认 markdown，支持配置 text 类型，发送纯 markdown 文本 | 可选 |
+
+#### 长桥替代能力矩阵（保留兜底）
+
+| 接口能力 | Longport 主实现 | 兜底策略 |
+|---|:---:|---|
+| 日线/历史 K 线 | ✅ | Akshare / Tushare / Yfinance |
+| 实时行情 | ✅ | Tencent / Akshare / Tushare |
+| 股票名称 | ✅（static_info） | 实时行情缓存 + 其他数据源 |
+| 主要指数 | ✅（优先尝试） | Akshare / Tushare / Yfinance |
+| 全市场股票列表 | ❌ | Tushare / Baostock / Akshare |
+| 市场涨跌统计 | ❌ | Akshare / Tushare |
+| 板块涨跌榜 | ❌ | Akshare |
 
 #### 3. 启用 Actions
 

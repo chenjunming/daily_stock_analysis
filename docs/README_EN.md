@@ -117,7 +117,23 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `STOCK_LIST` | Watchlist codes, e.g., `600519,AAPL,hk00700` | ✅ |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) Search API (for news) | Recommended |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) Backup search | Optional |
+| `LONGPORT_APP_KEY` | Longbridge OpenAPI App Key (HK/US + realtime enhancement) | Optional |
+| `LONGPORT_APP_SECRET` | Longbridge OpenAPI App Secret | Optional |
+| `LONGPORT_ACCESS_TOKEN` | Longbridge OpenAPI Access Token | Optional |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | Optional |
+| `REALTIME_SOURCE_PRIORITY` | Realtime source order (default: `longport,tencent,akshare_sina,efinance,akshare_em,tushare`) | Optional |
+
+#### Longport Replacement Matrix (with fallback)
+
+| Capability | Longport Primary | Fallback |
+|---|:---:|---|
+| Daily / Historical K-line | ✅ | Akshare / Tushare / Yfinance |
+| Realtime quote | ✅ | Tencent / Akshare / Tushare |
+| Stock name lookup | ✅ (`static_info`) | Realtime cache + other providers |
+| Major indices | ✅ (try first) | Akshare / Tushare / Yfinance |
+| Full stock list | ❌ | Tushare / Baostock / Akshare |
+| Market breadth stats | ❌ | Akshare / Tushare |
+| Sector rankings | ❌ | Akshare |
 
 **Stock Code Format**
 
@@ -371,7 +387,11 @@ SCHEDULE_TIME=18:00            # Daily run time (HH:MM, 24-hour format)
 MARKET_REVIEW_ENABLED=true     # Enable market review
 
 # === Data Source ===
-TUSHARE_TOKEN=your_token       # Tushare Pro (priority data source if configured)
+LONGPORT_APP_KEY=your_app_key
+LONGPORT_APP_SECRET=your_app_secret
+LONGPORT_ACCESS_TOKEN=your_access_token
+TUSHARE_TOKEN=your_token       # Keep as fallback
+REALTIME_SOURCE_PRIORITY=longport,tencent,akshare_sina,efinance,akshare_em,tushare
 
 # === System ===
 MAX_WORKERS=3                  # Concurrent threads (3 recommended to avoid blocking)

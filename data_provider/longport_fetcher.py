@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-LongportFetcher - 港美股稳定数据源
+LongportFetcher - 长桥行情数据源
 ===================================
 
 数据来源：Longbridge OpenAPI（longport Python SDK）
-特点：港股/美股行情稳定，需配置 API 凭证
+特点：港美股行情稳定，支持 A/HK/US 实时与名称补全，需配置 API 凭证
 
 支持能力：
 1. 日线历史数据（history_candlesticks_by_date）
 2. 实时行情（quote）
+3. 股票名称（static_info）
+4. 主要指数（quote，作为主尝试）
 """
 
 import logging
@@ -18,7 +20,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -36,6 +38,18 @@ class LongportFetcher(BaseFetcher):
 
     name = "LongportFetcher"
     priority = int(os.getenv("LONGPORT_PRIORITY", "-2"))
+    _DEFAULT_MAIN_INDICES: List[Tuple[str, str]] = [
+        ("000001.SH", "上证指数"),
+        ("399001.SZ", "深证成指"),
+        ("399006.SZ", "创业板指"),
+        ("000688.SH", "科创50"),
+        ("000016.SH", "上证50"),
+        ("000300.SH", "沪深300"),
+        ("HSI.HK", "恒生指数"),
+        ("HSTECH.HK", "恒生科技"),
+        ("SPY.US", "S&P 500 ETF"),
+        ("QQQ.US", "纳斯达克100 ETF"),
+    ]
 
     def __init__(self):
         self._config = get_config()
@@ -54,6 +68,7 @@ class LongportFetcher(BaseFetcher):
         self._ctx = None
         self._enabled = False
         self._name_cache: Dict[str, str] = {}
+        self._main_indices = self._load_main_indices_from_env()
         self._init_client()
         if not self._enabled:
             # 凭证未配置时降低优先级，避免影响默认链路
@@ -255,6 +270,34 @@ class LongportFetcher(BaseFetcher):
 
         return None
 
+    @classmethod
+    def _load_main_indices_from_env(cls) -> List[Tuple[str, str]]:
+        """
+        支持通过 LONGPORT_MAIN_INDICES 覆盖指数映射。
+
+        格式: SYMBOL:名称,SYMBOL:名称
+        示例: 000001.SH:上证指数,399001.SZ:深证成指,SPY.US:S&P 500 ETF
+        """
+        raw = (os.getenv("LONGPORT_MAIN_INDICES", "") or "").strip()
+        if not raw:
+            return list(cls._DEFAULT_MAIN_INDICES)
+
+        parsed: List[Tuple[str, str]] = []
+        for chunk in raw.split(","):
+            text = chunk.strip()
+            if not text:
+                continue
+            if ":" in text:
+                symbol, name = text.split(":", 1)
+            else:
+                symbol, name = text, text
+            symbol = symbol.strip().upper()
+            name = name.strip()
+            if symbol:
+                parsed.append((symbol, name or symbol))
+
+        return parsed or list(cls._DEFAULT_MAIN_INDICES)
+
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         if not self.is_available():
             raise DataFetchError("Longport 未启用或初始化失败")
@@ -335,6 +378,89 @@ class LongportFetcher(BaseFetcher):
 
         self._name_cache[symbol] = name
         return name
+
+    @staticmethod
+    def _index_code_from_symbol(symbol: str) -> str:
+        raw = (symbol or "").strip().upper()
+        if "." in raw:
+            return raw.split(".", 1)[0]
+        return raw
+
+    def get_stock_name(self, stock_code: str) -> Optional[str]:
+        """
+        获取股票名称（Longport static_info）。
+        """
+        code = (stock_code or "").strip().upper()
+        if not code or not self.is_available():
+            return None
+
+        if code in self._name_cache and self._name_cache[code]:
+            return self._name_cache[code]
+
+        symbol = self._to_longport_symbol(code)
+        if not symbol:
+            return None
+
+        name = self._resolve_name(symbol)
+        if name:
+            self._name_cache[code] = name
+            return name
+        return None
+
+    def get_main_indices(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        获取主要指数行情（Longport 优先）。
+        任何单个指数查询失败时跳过，整体失败返回 None，让管理器回退其他数据源。
+        """
+        if not self.is_available():
+            return None
+
+        results: List[Dict[str, Any]] = []
+        for symbol, display_name in self._main_indices:
+            try:
+                quotes = self._call_with_refresh(self._ctx.quote, [symbol])
+                if not quotes:
+                    continue
+                q = quotes[0]
+                current = safe_float(getattr(q, "last_done", None))
+                if current is None or current <= 0:
+                    continue
+
+                prev_close = safe_float(getattr(q, "prev_close", None), 0.0) or 0.0
+                change = safe_float(getattr(q, "change_value", None))
+                change_pct = safe_float(getattr(q, "change_rate", None))
+                if change is None and prev_close > 0:
+                    change = current - prev_close
+                if change_pct is None and prev_close > 0:
+                    change_pct = ((current - prev_close) / prev_close) * 100
+
+                high = safe_float(getattr(q, "high", None), current) or current
+                low = safe_float(getattr(q, "low", None), current) or current
+                amplitude = 0.0
+                if prev_close > 0:
+                    amplitude = ((high - low) / prev_close) * 100
+
+                results.append(
+                    {
+                        "code": self._index_code_from_symbol(symbol),
+                        "name": display_name,
+                        "current": current,
+                        "change": change or 0.0,
+                        "change_pct": change_pct or 0.0,
+                        "open": safe_float(getattr(q, "open", None), current) or current,
+                        "high": high,
+                        "low": low,
+                        "prev_close": prev_close,
+                        "volume": safe_float(getattr(q, "volume", None), 0.0) or 0.0,
+                        "amount": safe_float(getattr(q, "turnover", None), 0.0) or 0.0,
+                        "amplitude": amplitude,
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"[Longport] 指数行情查询失败 {symbol}: {e}")
+                continue
+
+        return results or None
 
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         if not self.is_available():
@@ -436,6 +562,34 @@ class LongportFetcher(BaseFetcher):
         volume = session_volume
         amount = session_amount
         name = self._resolve_name(symbol)
+        turnover_rate = None
+        volume_ratio = None
+        pe_ratio = None
+        pb_ratio = None
+        total_mv = None
+
+        # calc_indexes 为增强信息，失败不影响主报价。
+        try:
+            calc_data = self._call_with_refresh(
+                self._ctx.calc_indexes,
+                [symbol],
+                [
+                    self._api.CalcIndex.TurnoverRate,
+                    self._api.CalcIndex.VolumeRatio,
+                    self._api.CalcIndex.PeTtmRatio,
+                    self._api.CalcIndex.PbRatio,
+                    self._api.CalcIndex.TotalMarketValue,
+                ],
+            )
+            if calc_data:
+                calc = calc_data[0]
+                turnover_rate = safe_float(getattr(calc, "turnover_rate", None))
+                volume_ratio = safe_float(getattr(calc, "volume_ratio", None))
+                pe_ratio = safe_float(getattr(calc, "pe_ttm_ratio", None))
+                pb_ratio = safe_float(getattr(calc, "pb_ratio", None))
+                total_mv = safe_float(getattr(calc, "total_market_value", None))
+        except Exception as e:
+            logger.debug(f"[Longport] calc_indexes 获取失败 {stock_code}: {e}")
 
         change_amount = None
         change_pct = None
@@ -452,10 +606,15 @@ class LongportFetcher(BaseFetcher):
             change_amount=change_amount,
             volume=volume,
             amount=amount,
+            volume_ratio=volume_ratio,
+            turnover_rate=turnover_rate,
             open_price=open_price,
             high=high,
             low=low,
             pre_close=pre_close,
+            pe_ratio=pe_ratio,
+            pb_ratio=pb_ratio,
+            total_mv=total_mv,
             trade_session=str(getattr(q, "trade_session", "") or "").strip() or None,
             price_session=session_label,
             price_timestamp=session_ts.isoformat() if hasattr(session_ts, "isoformat") else None,

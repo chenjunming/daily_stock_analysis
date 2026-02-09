@@ -845,8 +845,23 @@ class DataFetcherManager:
         return result
 
     def get_main_indices(self) -> List[Dict[str, Any]]:
-        """获取主要指数实时行情（自动切换数据源）"""
+        """获取主要指数实时行情（Longport 优先，失败自动回退）"""
+        # Longport 优先尝试；若不可用或返回空，继续走现有多源降级链路
         for fetcher in self._fetchers:
+            if fetcher.name != "LongportFetcher":
+                continue
+            try:
+                data = fetcher.get_main_indices()
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取指数行情成功")
+                    return data
+            except Exception as e:
+                logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
+            break
+
+        for fetcher in self._fetchers:
+            if fetcher.name == "LongportFetcher":
+                continue
             try:
                 data = fetcher.get_main_indices()
                 if data:
